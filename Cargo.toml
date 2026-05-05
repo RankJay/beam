@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/beam-core", "crates/beam-cli", "crates/beam-relay"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Beam contributors"]
+rust-version = "1.78"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[workspace.lints.rust]
+unsafe_code = "deny"

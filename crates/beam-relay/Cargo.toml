@@ -1,0 +1,13 @@
+[package]
+name = "beam-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Beam rendezvous and relay service (stubs in early phases)."
+
+[lints]
+workspace = true
+
+[dependencies]
+beam-core = { path = "../beam-core" }
