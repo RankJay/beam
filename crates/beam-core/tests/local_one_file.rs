@@ -8,10 +8,7 @@ use tempfile::TempDir;
 use beam_core::{
     chunking::{chunk_count_for_size, DEFAULT_CHUNK_SIZE},
     local_transfer::{
-        transfer_one_file_local,
-        DestinationConflictPolicy,
-        LocalProvider,
-        LocalReceiver,
+        transfer_one_file_local, DestinationConflictPolicy, LocalProvider, LocalReceiver,
     },
     manifest::{manifest_from_plaintext_file, ChunkHashCommitment},
     TransferError,
@@ -52,7 +49,11 @@ fn harness_empty_small_one_and_multi_chunk_and_default_recorded_on_manifest() {
         chunk_size,
     );
 
-    fs::write(dir.path().join("default.chunk"), b"records size on manifest").expect("write body");
+    fs::write(
+        dir.path().join("default.chunk"),
+        b"records size on manifest",
+    )
+    .expect("write body");
     let dest = dir.path().join("out-default.chunk");
     let staging = staging_dir.path().join("st-default.chunk");
     transfer_one_file_local(
@@ -74,12 +75,7 @@ fn harness_empty_small_one_and_multi_chunk_and_default_recorded_on_manifest() {
     assert_eq!(dst.chunk_size, DEFAULT_CHUNK_SIZE);
 }
 
-fn assert_manifest_roundtrip(
-    src: &Path,
-    staging_file: &Path,
-    extract_dir: &Path,
-    chunk_size: u64,
-) {
+fn assert_manifest_roundtrip(src: &Path, staging_file: &Path, extract_dir: &Path, chunk_size: u64) {
     let file_name = src.file_name().expect("basename");
     let dest = extract_dir.join("out").join(file_name);
     let parent = dest.parent().expect("parent");
@@ -133,8 +129,7 @@ fn corrupted_payload_fails_verification() {
     fs::write(&src, [1, 2, 3, 4]).expect("bytes");
 
     let chunk_size = 2u64;
-    let provider =
-        LocalProvider::from_file(&src, "a.bin", chunk_size).expect("provider manifest");
+    let provider = LocalProvider::from_file(&src, "a.bin", chunk_size).expect("provider manifest");
     let mut receiver = LocalReceiver::new(
         provider.manifest().clone(),
         dir.path().join("st.bin"),
@@ -151,8 +146,7 @@ fn corrupted_payload_fails_verification() {
     ));
 
     let chunk_size = 2u64;
-    let provider =
-        LocalProvider::from_file(&src, "a.bin", chunk_size).expect("provider manifest");
+    let provider = LocalProvider::from_file(&src, "a.bin", chunk_size).expect("provider manifest");
     let mut receiver = LocalReceiver::new(
         provider.manifest().clone(),
         dir.path().join("st.bin"),
@@ -237,8 +231,7 @@ fn pending_chunk_hashes_are_not_received() {
     let src = dir.path().join("pending.bin");
     fs::write(&src, b"abcd").expect("bytes");
 
-    let mut manifest =
-        manifest_from_plaintext_file(&src, "pending.bin", 2).expect("manifest");
+    let mut manifest = manifest_from_plaintext_file(&src, "pending.bin", 2).expect("manifest");
     manifest.chunk_hashes[0] = ChunkHashCommitment::Pending;
 
     let mut recv = LocalReceiver::new(

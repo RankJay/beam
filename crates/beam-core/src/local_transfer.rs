@@ -28,10 +28,13 @@ pub struct LocalProvider {
 
 impl LocalProvider {
     /// Hash plaintext and build commitments for every chunk (`Pending` hashes are preserved if added later elsewhere).
-    pub fn from_file(source: impl Into<PathBuf>, relative_path: &str, chunk_size: u64) -> Result<Self, TransferError> {
+    pub fn from_file(
+        source: impl Into<PathBuf>,
+        relative_path: &str,
+        chunk_size: u64,
+    ) -> Result<Self, TransferError> {
         let source = source.into();
-        let manifest =
-            manifest_from_plaintext_file(&source, relative_path, chunk_size)?;
+        let manifest = manifest_from_plaintext_file(&source, relative_path, chunk_size)?;
         Ok(Self { source, manifest })
     }
 
@@ -65,11 +68,9 @@ impl LocalReceiver {
         conflict: DestinationConflictPolicy,
     ) -> Result<Self, TransferError> {
         manifest.validate()?;
-        let staging_parent = staging_path
-            .parent()
-            .ok_or(TransferError::InvalidManifest(
-                "staging path must have a parent directory",
-            ))?;
+        let staging_parent = staging_path.parent().ok_or(TransferError::InvalidManifest(
+            "staging path must have a parent directory",
+        ))?;
         fs::create_dir_all(staging_parent)?;
 
         let file = OpenOptions::new()
@@ -113,7 +114,8 @@ impl LocalReceiver {
     /// Verify a plaintext chunk against its committed Blake3 digest and write it at the staged offset (ADR 0077, 0082).
     pub fn receive_chunk(&mut self, index: u32, payload: &[u8]) -> Result<(), TransferError> {
         let count = self.manifest.chunk_count;
-        let Some((offset, expected_len_u64)) = chunk_span(self.manifest.size, self.manifest.chunk_size, index)
+        let Some((offset, expected_len_u64)) =
+            chunk_span(self.manifest.size, self.manifest.chunk_size, index)
         else {
             return Err(TransferError::ChunkIndexOutOfBounds { index, count });
         };
@@ -178,7 +180,9 @@ impl LocalReceiver {
             return Err(TransferError::FileDigestMismatch);
         }
 
-        if matches!(self.conflict, DestinationConflictPolicy::FailIfExists) && self.destination.exists() {
+        if matches!(self.conflict, DestinationConflictPolicy::FailIfExists)
+            && self.destination.exists()
+        {
             return Err(TransferError::DestinationExists(self.destination.clone()));
         }
 
@@ -201,11 +205,15 @@ pub fn transfer_one_file_local(
         fs::create_dir_all(parent)?;
     }
 
-    let provider =
-        LocalProvider::from_file(source.to_path_buf(), relative_path, chunk_size)?;
+    let provider = LocalProvider::from_file(source.to_path_buf(), relative_path, chunk_size)?;
     let manifest = provider.manifest().clone();
 
-    let mut receiver = LocalReceiver::new(manifest, staging.to_path_buf(), destination.to_path_buf(), conflict)?;
+    let mut receiver = LocalReceiver::new(
+        manifest,
+        staging.to_path_buf(),
+        destination.to_path_buf(),
+        conflict,
+    )?;
 
     for chunk_index in 0..provider.manifest().chunk_count {
         let data = provider.read_chunk(chunk_index)?;
@@ -215,7 +223,11 @@ pub fn transfer_one_file_local(
     receiver.finalize()
 }
 
-pub(crate) fn read_file_chunk(source: &Path, manifest: &OneFileManifest, index: u32) -> Result<Vec<u8>, TransferError> {
+pub(crate) fn read_file_chunk(
+    source: &Path,
+    manifest: &OneFileManifest,
+    index: u32,
+) -> Result<Vec<u8>, TransferError> {
     let count = manifest.chunk_count;
     let Some((off, len)) = chunk_span(manifest.size, manifest.chunk_size, index) else {
         return Err(TransferError::ChunkIndexOutOfBounds { index, count });

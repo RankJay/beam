@@ -66,7 +66,10 @@ impl fmt::Display for TransferError {
                 )
             }
             TransferError::FileDigestMismatch => {
-                write!(f, "staged file digest does not match manifest file commitment")
+                write!(
+                    f,
+                    "staged file digest does not match manifest file commitment"
+                )
             }
             TransferError::DestinationExists(p) => {
                 write!(

@@ -92,7 +92,9 @@ pub fn manifest_from_plaintext_file(
             let take = (buf.len() as u64).min(remaining) as usize;
             let n = read_exact_up_to(&mut file, &mut buf[..take])?;
             if n == 0 {
-                return Err(TransferError::InvalidManifest("unexpected EOF hashing file"));
+                return Err(TransferError::InvalidManifest(
+                    "unexpected EOF hashing file",
+                ));
             }
             whole.update(&buf[..n]);
             chunk_hasher.update(&buf[..n]);
