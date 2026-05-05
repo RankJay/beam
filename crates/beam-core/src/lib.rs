@@ -12,10 +12,16 @@ pub mod folder_snapshot;
 pub mod local_transfer;
 pub mod manifest;
 pub mod pairing;
+pub mod paths;
+pub mod retry;
 pub mod session_crypto;
 pub mod session_file;
 
 pub use error::TransferError;
+pub use paths::{beam_cache_dir, beam_data_dir, beam_sessions_dir};
+pub use retry::{
+    pairing_error_is_transient_transport, transfer_error_is_transient_transport, RetryPolicy,
+};
 pub use manifest::manifest_from_plaintext_file;
 pub use manifest::ChunkHashCommitment;
 pub use manifest::OneFileManifest;

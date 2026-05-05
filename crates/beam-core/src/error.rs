@@ -46,6 +46,10 @@ pub enum TransferError {
     DirectQuicTransport(&'static str),
     /// Blind relay byte pipe HTTP transport (ADR 0034).
     RelayPipe(&'static str),
+    /// Relay HTTP status likely to succeed after backoff (Phase 9); not used for 4xx auth semantics.
+    RelayHttpTransient {
+        status: u16,
+    },
     /// Local session file missing, unreadable, or not valid JSON (Phase 7).
     SessionState(&'static str),
     /// Persisted session was created on another machine (ADR 0059).
@@ -126,6 +130,12 @@ impl fmt::Display for TransferError {
             }
             TransferError::RelayPipe(msg) => {
                 write!(f, "relay pipe error: {msg}")
+            }
+            TransferError::RelayHttpTransient { status } => {
+                write!(
+                    f,
+                    "relay HTTP {status} (transient; may retry under policy)"
+                )
             }
             TransferError::SessionState(msg) => {
                 write!(f, "session state: {msg}")

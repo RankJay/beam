@@ -19,6 +19,7 @@ use rand::{rngs::OsRng, TryRngCore};
 use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 
+use crate::retry::RetryPolicy;
 use crate::session_crypto::{invite_context_from_pairing, InviteContext, SessionSecrets};
 
 const INVITE_LINE_PREFIX: &str = "beam-invite-v1";
@@ -926,12 +927,13 @@ impl PairingRelay for HttpRelay {
         expires_unix: u64,
         msg: &[u8],
     ) -> Result<(), PairingError> {
-        let resp = self
-            .agent
-            .put(&self.url_sender(room_id))
-            .header(HTTP_RELAY_EXPIRES_HEADER, &expires_unix.to_string())
-            .send(msg)
-            .map_err(http_transport)?;
+        let resp = RetryPolicy::relay_http_default().retry_pairing_blocking(|| {
+            self.agent
+                .put(&self.url_sender(room_id))
+                .header(HTTP_RELAY_EXPIRES_HEADER, &expires_unix.to_string())
+                .send(msg)
+                .map_err(http_transport)
+        })?;
         match resp.status().as_u16() {
             201 | 204 => Ok(()),
             409 => Err(PairingError::Relay("sender message already registered")),
@@ -950,7 +952,8 @@ impl PairingRelay for HttpRelay {
         let url = self.url_receiver(room_id);
         let start = Instant::now();
         loop {
-            let resp = self.agent.get(&url).call().map_err(http_transport)?;
+            let resp = RetryPolicy::relay_http_default()
+                .retry_pairing_blocking(|| self.agent.get(&url).call().map_err(http_transport))?;
             match resp.status().as_u16() {
                 200 => return http_read_body(resp),
                 404 => {}
@@ -974,7 +977,8 @@ impl PairingRelay for HttpRelay {
         let url = self.url_sender(room_id);
         let start = Instant::now();
         loop {
-            let resp = self.agent.get(&url).call().map_err(http_transport)?;
+            let resp = RetryPolicy::relay_http_default()
+                .retry_pairing_blocking(|| self.agent.get(&url).call().map_err(http_transport))?;
             match resp.status().as_u16() {
                 200 => return http_read_body(resp),
                 404 => {}
@@ -991,11 +995,12 @@ impl PairingRelay for HttpRelay {
     }
 
     fn put_receiver_message(&mut self, room_id: &[u8; 16], msg: &[u8]) -> Result<(), PairingError> {
-        let resp = self
-            .agent
-            .put(&self.url_receiver(room_id))
-            .send(msg)
-            .map_err(http_transport)?;
+        let resp = RetryPolicy::relay_http_default().retry_pairing_blocking(|| {
+            self.agent
+                .put(&self.url_receiver(room_id))
+                .send(msg)
+                .map_err(http_transport)
+        })?;
         match resp.status().as_u16() {
             204 => Ok(()),
             409 => Err(PairingError::Relay("receiver message already present")),
@@ -1005,11 +1010,12 @@ impl PairingRelay for HttpRelay {
     }
 
     fn consume_room(&mut self, room_id: &[u8; 16]) -> Result<(), PairingError> {
-        let resp = self
-            .agent
-            .delete(&self.url_room(room_id))
-            .call()
-            .map_err(http_transport)?;
+        let resp = RetryPolicy::relay_http_default().retry_pairing_blocking(|| {
+            self.agent
+                .delete(&self.url_room(room_id))
+                .call()
+                .map_err(http_transport)
+        })?;
         match resp.status().as_u16() {
             204 => Ok(()),
             _ => Err(PairingError::Relay("http relay delete room failed")),

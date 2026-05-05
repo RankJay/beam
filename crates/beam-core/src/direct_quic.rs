@@ -19,6 +19,7 @@ use tokio::sync::oneshot;
 
 use crate::error::TransferError;
 use crate::local_transfer::{DestinationConflictPolicy, LocalProvider, LocalReceiver};
+use crate::retry::RetryPolicy;
 use crate::manifest::OneFileManifest;
 use crate::session_crypto::{
     decode_manifest_plaintext, decrypt_chunk_payload, decrypt_control_payload,
@@ -700,17 +701,19 @@ fn relay_put_frame(
     expires_unix: u64,
     wire: &[u8],
 ) -> Result<(), TransferError> {
-    let resp = agent
-        .put(url)
-        .header("x-beam-expires", &expires_unix.to_string())
-        .header(RELAY_PIPE_GATE_HEADER, gate_hex)
-        .send(wire)
-        .map_err(|_| TransferError::RelayPipe("pipe PUT transport failed"))?;
-    match resp.status().as_u16() {
-        204 => Ok(()),
-        410 => Err(TransferError::RelayPipe("pipe expired (gone)")),
-        _ => Err(TransferError::RelayPipe("pipe PUT rejected")),
-    }
+    RetryPolicy::relay_http_default().retry_transfer_blocking(|| {
+        let resp = agent
+            .put(url)
+            .header("x-beam-expires", &expires_unix.to_string())
+            .header(RELAY_PIPE_GATE_HEADER, gate_hex)
+            .send(wire)
+            .map_err(|_| TransferError::RelayPipe("pipe PUT transport failed"))?;
+        match resp.status().as_u16() {
+            204 => Ok(()),
+            410 => Err(TransferError::RelayPipe("pipe expired (gone)")),
+            _ => Err(TransferError::RelayPipe("pipe PUT rejected")),
+        }
+    })
 }
 
 fn relay_get_frame_poll(
@@ -719,24 +722,26 @@ fn relay_get_frame_poll(
     gate_hex: &str,
     expires_unix: u64,
 ) -> Result<Option<Vec<u8>>, TransferError> {
-    let mut resp = agent
-        .get(url)
-        .header("x-beam-expires", &expires_unix.to_string())
-        .header(RELAY_PIPE_GATE_HEADER, gate_hex)
-        .call()
-        .map_err(|_| TransferError::RelayPipe("pipe GET transport failed"))?;
-    match resp.status().as_u16() {
-        200 => {
-            let body = resp
-                .body_mut()
-                .read_to_vec()
-                .map_err(|_| TransferError::RelayPipe("pipe GET body failed"))?;
-            Ok(Some(body))
+    RetryPolicy::relay_http_default().retry_transfer_blocking(|| {
+        let mut resp = agent
+            .get(url)
+            .header("x-beam-expires", &expires_unix.to_string())
+            .header(RELAY_PIPE_GATE_HEADER, gate_hex)
+            .call()
+            .map_err(|_| TransferError::RelayPipe("pipe GET transport failed"))?;
+        match resp.status().as_u16() {
+            200 => {
+                let body = resp
+                    .body_mut()
+                    .read_to_vec()
+                    .map_err(|_| TransferError::RelayPipe("pipe GET body failed"))?;
+                Ok(Some(body))
+            }
+            404 => Ok(None),
+            410 => Err(TransferError::RelayPipe("pipe expired (gone)")),
+            _ => Err(TransferError::RelayPipe("pipe GET rejected")),
         }
-        404 => Ok(None),
-        410 => Err(TransferError::RelayPipe("pipe expired (gone)")),
-        _ => Err(TransferError::RelayPipe("pipe GET rejected")),
-    }
+    })
 }
 
 fn relay_get_frame_loop(
