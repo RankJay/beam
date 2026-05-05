@@ -72,6 +72,8 @@ pub enum RendezvousRelay {
     Default,
     /// Local mailbox directory used by [`FsRelay`].
     BeamFs(PathBuf),
+    /// HTTP(S) rendezvous base URL (no trailing slash), served by `beam-relay`.
+    Http(String),
     /// Parsed relay string without a built-in transport implementation yet.
     Unsupported(String),
 }
@@ -135,6 +137,7 @@ fn relay_tag_bytes(relay: &RendezvousRelay) -> Vec<u8> {
             v.extend_from_slice(p.as_os_str().as_encoded_bytes());
             v
         }
+        RendezvousRelay::Http(url) => url.as_bytes().to_vec(),
         RendezvousRelay::Unsupported(s) => s.as_bytes().to_vec(),
     }
 }
@@ -285,11 +288,17 @@ fn take<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8], PairingError> {
     Ok(head)
 }
 
+pub(crate) fn normalize_http_relay_base(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_owned()
+}
+
 fn relay_from_url(url: &str) -> RendezvousRelay {
     if url == "default" {
         RendezvousRelay::Default
     } else if let Some(rest) = url.strip_prefix(RELAY_BEAM_FS_PREFIX) {
         RendezvousRelay::BeamFs(PathBuf::from(rest))
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        RendezvousRelay::Http(normalize_http_relay_base(url))
     } else {
         RendezvousRelay::Unsupported(url.to_owned())
     }
@@ -326,6 +335,37 @@ pub fn prepare_invite_human_words(
     })
 }
 
+/// Human-word invite embedding an HTTP(S) relay base URL (receiver reaches the same host as in the invite).
+pub fn prepare_invite_human_words_http(
+    ttl_seconds: u64,
+    relay_base_url: &str,
+) -> Result<PreparedInvite, PairingError> {
+    validate_word_list()?;
+    let mut room_id = [0u8; 16];
+    let mut seed = [0u8; 10];
+    let mut rng = OsRng;
+    rng.try_fill_bytes(&mut room_id)
+        .map_err(|_| PairingError::Crypto("rng room id"))?;
+    rng.try_fill_bytes(&mut seed)
+        .map_err(|_| PairingError::Crypto("rng seed"))?;
+    let expires_unix = unix_now_secs().saturating_add(ttl_seconds);
+    let relay_url = normalize_http_relay_base(relay_base_url);
+    let relay = RendezvousRelay::Http(relay_url.clone());
+    let room_b64 = URL_SAFE_NO_PAD.encode(room_id);
+    let url_b64 = URL_SAFE_NO_PAD.encode(relay_url.as_bytes());
+    let words = words_from_seed(&seed)?;
+    let line = format!(
+        "{INVITE_LINE_PREFIX}\tword\thttp\t{expires_unix}\t{room_b64}\t{url_b64}\t{words}"
+    );
+    Ok(PreparedInvite {
+        invite_line: line,
+        room_id,
+        expires_unix,
+        seed,
+        relay,
+    })
+}
+
 /// Compact base64url token for copy/paste; embeds relay URL and cryptographic seed material.
 pub fn prepare_invite_long_token(
     ttl_seconds: u64,
@@ -339,10 +379,15 @@ pub fn prepare_invite_long_token(
     rng.try_fill_bytes(&mut seed)
         .map_err(|_| PairingError::Crypto("rng seed"))?;
     let expires_unix = unix_now_secs().saturating_add(ttl_seconds);
-    let payload = encode_token_v1(expires_unix, &room_id, relay_url, &seed)?;
+    let relay_url_stored = if relay_url.starts_with("http://") || relay_url.starts_with("https://") {
+        normalize_http_relay_base(relay_url)
+    } else {
+        relay_url.to_owned()
+    };
+    let payload = encode_token_v1(expires_unix, &room_id, &relay_url_stored, &seed)?;
     let token = URL_SAFE_NO_PAD.encode(&payload);
     let line = format!("{INVITE_LINE_PREFIX}\ttoken\t{token}");
-    let relay = relay_from_url(relay_url);
+    let relay = relay_from_url(&relay_url_stored);
     Ok(PreparedInvite {
         invite_line: line,
         room_id,
@@ -379,16 +424,34 @@ pub fn prepare_invite_default_word_stub(ttl_seconds: u64) -> Result<PreparedInvi
 pub fn parse_invite_line(line: &str) -> Result<ParsedInvite, PairingError> {
     let line = line.trim();
     let parts: Vec<&str> = line.split('\t').collect();
-    if parts.len() < 3 {
-        return Err(PairingError::InvalidInvite("line too short"));
+    if parts.len() >= 3 && parts[0] == INVITE_LINE_PREFIX {
+        return match parts[1] {
+            "word" => parse_word_invite(&parts),
+            "token" => parse_token_invite(parts[2]),
+            _ => Err(PairingError::InvalidInvite("unknown invite kind")),
+        };
     }
-    if parts[0] != INVITE_LINE_PREFIX {
+    parse_invite_line_whitespace_token_fallback(line)
+}
+
+/// Token invites may be pasted with spaces instead of tabs (Windows consoles).
+fn parse_invite_line_whitespace_token_fallback(line: &str) -> Result<ParsedInvite, PairingError> {
+    let line = line.trim();
+    if !line.starts_with(INVITE_LINE_PREFIX) {
         return Err(PairingError::InvalidInvite("unknown magic"));
     }
-    match parts[1] {
-        "word" => parse_word_invite(&parts),
-        "token" => parse_token_invite(parts[2]),
-        _ => Err(PairingError::InvalidInvite("unknown invite kind")),
+    let rest = line[INVITE_LINE_PREFIX.len()..].trim_start();
+    let mut iter = rest.split_whitespace();
+    match (iter.next(), iter.next()) {
+        (Some("token"), Some(tok)) => {
+            if iter.next().is_some() {
+                return Err(PairingError::InvalidInvite(
+                    "token invite must be exactly three fields",
+                ));
+            }
+            parse_token_invite(tok)
+        }
+        _ => Err(PairingError::InvalidInvite("line too short")),
     }
 }
 
@@ -427,6 +490,29 @@ fn parse_word_invite(parts: &[&str]) -> Result<ParsedInvite, PairingError> {
             let seed = seed_from_words_blob(words_blob)?;
             Ok(ParsedInvite {
                 relay: RendezvousRelay::Default,
+                room_id,
+                expires_unix,
+                seed,
+            })
+        }
+        "http" => {
+            let url_b64 = parts
+                .get(5)
+                .copied()
+                .ok_or(PairingError::InvalidInvite("missing relay URL"))?;
+            let url_bytes = URL_SAFE_NO_PAD
+                .decode(url_b64.as_bytes())
+                .map_err(|_| PairingError::InvalidInvite("relay URL is not valid base64"))?;
+            let relay_url = std::str::from_utf8(&url_bytes)
+                .map_err(|_| PairingError::InvalidInvite("relay URL is not utf-8"))?;
+            let relay = relay_from_url(relay_url);
+            let words_blob = parts
+                .get(6)
+                .copied()
+                .ok_or(PairingError::InvalidInvite("missing words"))?;
+            let seed = seed_from_words_blob(words_blob)?;
+            Ok(ParsedInvite {
+                relay,
                 room_id,
                 expires_unix,
                 seed,
@@ -499,7 +585,8 @@ pub trait PairingRelay {
     fn consume_room(&mut self, room_id: &[u8; 16]) -> Result<(), PairingError>;
 }
 
-fn room_hex(room_id: &[u8; 16]) -> String {
+#[must_use]
+pub fn room_id_hex(room_id: &[u8; 16]) -> String {
     let mut s = String::with_capacity(32);
     for b in room_id {
         use core::fmt::Write;
@@ -521,7 +608,7 @@ impl FsRelay {
     }
 
     fn room_dir(&self, room_id: &[u8; 16]) -> PathBuf {
-        self.root.join(room_hex(room_id))
+        self.root.join(room_id_hex(room_id))
     }
 
     fn write_meta_expiry(&self, room_dir: &Path, expires_unix: u64) -> Result<(), PairingError> {
@@ -768,6 +855,265 @@ impl PairingRelay for MemoryRelay {
     }
 }
 
+const HTTP_RELAY_EXPIRES_HEADER: &str = "x-beam-expires";
+
+fn http_read_body(mut resp: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>, PairingError> {
+    resp.body_mut()
+        .read_to_vec()
+        .map_err(|_| PairingError::Relay("http relay body read failed"))
+}
+
+fn http_transport(err: ureq::Error) -> PairingError {
+    match err {
+        ureq::Error::StatusCode(410) => PairingError::Expired,
+        ureq::Error::StatusCode(409) => PairingError::Relay("http relay conflict"),
+        ureq::Error::Io(ref e) => PairingError::Relay(match e.kind() {
+            std::io::ErrorKind::ConnectionRefused => {
+                "http relay unreachable (connection refused — is beam-relay listening on this URL?)"
+            }
+            std::io::ErrorKind::TimedOut => "http relay request timed out",
+            _ => "http relay I/O error",
+        }),
+        _ => PairingError::Relay("http relay transport error"),
+    }
+}
+
+/// HTTP rendezvous client matching `beam-relay`'s `/v1/rooms/...` API.
+#[derive(Clone)]
+pub struct HttpRelay {
+    base: String,
+    agent: ureq::Agent,
+}
+
+impl fmt::Debug for HttpRelay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpRelay").field("base", &self.base).finish()
+    }
+}
+
+impl HttpRelay {
+    #[must_use]
+    pub fn new(base_url: impl Into<String>) -> Self {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        Self {
+            base: normalize_http_relay_base(&base_url.into()),
+            agent,
+        }
+    }
+
+    fn url_sender(&self, room_id: &[u8; 16]) -> String {
+        format!(
+            "{}/v1/rooms/{}/sender",
+            self.base,
+            room_id_hex(room_id)
+        )
+    }
+
+    fn url_receiver(&self, room_id: &[u8; 16]) -> String {
+        format!(
+            "{}/v1/rooms/{}/receiver",
+            self.base,
+            room_id_hex(room_id)
+        )
+    }
+
+    fn url_room(&self, room_id: &[u8; 16]) -> String {
+        format!("{}/v1/rooms/{}", self.base, room_id_hex(room_id))
+    }
+}
+
+impl PairingRelay for HttpRelay {
+    fn put_sender_message(
+        &mut self,
+        room_id: &[u8; 16],
+        expires_unix: u64,
+        msg: &[u8],
+    ) -> Result<(), PairingError> {
+        let resp = self
+            .agent
+            .put(&self.url_sender(room_id))
+            .header(HTTP_RELAY_EXPIRES_HEADER, &expires_unix.to_string())
+            .send(msg)
+            .map_err(http_transport)?;
+        match resp.status().as_u16() {
+            201 | 204 => Ok(()),
+            409 => Err(PairingError::Relay("sender message already registered")),
+            410 => Err(PairingError::Expired),
+            _ => Err(PairingError::Relay(
+                "http relay rejected sender registration",
+            )),
+        }
+    }
+
+    fn wait_receiver_message(
+        &mut self,
+        room_id: &[u8; 16],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, PairingError> {
+        let url = self.url_receiver(room_id);
+        let start = Instant::now();
+        loop {
+            let resp = self.agent.get(&url).call().map_err(http_transport)?;
+            match resp.status().as_u16() {
+                200 => return http_read_body(resp),
+                404 => {}
+                410 => return Err(PairingError::Expired),
+                _ => return Err(PairingError::Relay("http relay GET receiver failed")),
+            }
+            if start.elapsed() > timeout {
+                return Err(PairingError::Relay(
+                    "timed out waiting for receiver PAKE message",
+                ));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_sender_message(
+        &mut self,
+        room_id: &[u8; 16],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, PairingError> {
+        let url = self.url_sender(room_id);
+        let start = Instant::now();
+        loop {
+            let resp = self.agent.get(&url).call().map_err(http_transport)?;
+            match resp.status().as_u16() {
+                200 => return http_read_body(resp),
+                404 => {}
+                410 => return Err(PairingError::Expired),
+                _ => return Err(PairingError::Relay("http relay GET sender failed")),
+            }
+            if start.elapsed() > timeout {
+                return Err(PairingError::Relay(
+                    "timed out waiting for sender PAKE message",
+                ));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn put_receiver_message(&mut self, room_id: &[u8; 16], msg: &[u8]) -> Result<(), PairingError> {
+        let resp = self
+            .agent
+            .put(&self.url_receiver(room_id))
+            .send(msg)
+            .map_err(http_transport)?;
+        match resp.status().as_u16() {
+            204 => Ok(()),
+            409 => Err(PairingError::Relay("receiver message already present")),
+            410 => Err(PairingError::Expired),
+            _ => Err(PairingError::Relay("http relay rejected receiver message")),
+        }
+    }
+
+    fn consume_room(&mut self, room_id: &[u8; 16]) -> Result<(), PairingError> {
+        let resp = self
+            .agent
+            .delete(&self.url_room(room_id))
+            .call()
+            .map_err(http_transport)?;
+        match resp.status().as_u16() {
+            204 => Ok(()),
+            _ => Err(PairingError::Relay("http relay delete room failed")),
+        }
+    }
+}
+
+/// Chooses filesystem vs HTTP transport for [`PairingRelay`] operations.
+#[derive(Debug)]
+pub enum RelayTransport {
+    Fs(FsRelay),
+    Http(HttpRelay),
+}
+
+impl RelayTransport {
+    /// Opens the transport implied by a locally prepared invite (`send` side).
+    #[must_use]
+    pub fn for_sender_prepare(prepared: &PreparedInvite) -> Result<Self, String> {
+        match &prepared.relay {
+            RendezvousRelay::BeamFs(path) => Ok(Self::Fs(FsRelay::new(path))),
+            RendezvousRelay::Http(url) => Ok(Self::Http(HttpRelay::new(url))),
+            RendezvousRelay::Default => Err(
+                "invite relay kind \"default\" cannot drive sender_prepare transport selection".into(),
+            ),
+            RendezvousRelay::Unsupported(url) => Err(format!(
+                "relay URL {url:?} is not supported for pairing transport"
+            )),
+        }
+    }
+
+    /// Opens the transport implied by a parsed invite (`recv` side).
+    #[must_use]
+    pub fn for_receiver(invite: &ParsedInvite, relay_dir_override: Option<PathBuf>) -> Result<Self, String> {
+        match (&invite.relay, relay_dir_override) {
+            (RendezvousRelay::BeamFs(path), _) => Ok(Self::Fs(FsRelay::new(path))),
+            (RendezvousRelay::Http(url), _) => Ok(Self::Http(HttpRelay::new(url))),
+            (RendezvousRelay::Default, Some(path)) => Ok(Self::Fs(FsRelay::new(path))),
+            (RendezvousRelay::Default, None) => Err(
+                "invite uses relay kind \"default\"; pass --relay-dir with the sender mailbox directory path"
+                    .into(),
+            ),
+            (RendezvousRelay::Unsupported(url), _) => Err(format!(
+                "relay URL {url:?} is not supported for pairing transport"
+            )),
+        }
+    }
+}
+
+impl PairingRelay for RelayTransport {
+    fn put_sender_message(
+        &mut self,
+        room_id: &[u8; 16],
+        expires_unix: u64,
+        msg: &[u8],
+    ) -> Result<(), PairingError> {
+        match self {
+            RelayTransport::Fs(r) => r.put_sender_message(room_id, expires_unix, msg),
+            RelayTransport::Http(r) => r.put_sender_message(room_id, expires_unix, msg),
+        }
+    }
+
+    fn wait_receiver_message(
+        &mut self,
+        room_id: &[u8; 16],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, PairingError> {
+        match self {
+            RelayTransport::Fs(r) => r.wait_receiver_message(room_id, timeout),
+            RelayTransport::Http(r) => r.wait_receiver_message(room_id, timeout),
+        }
+    }
+
+    fn wait_sender_message(
+        &mut self,
+        room_id: &[u8; 16],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, PairingError> {
+        match self {
+            RelayTransport::Fs(r) => r.wait_sender_message(room_id, timeout),
+            RelayTransport::Http(r) => r.wait_sender_message(room_id, timeout),
+        }
+    }
+
+    fn put_receiver_message(&mut self, room_id: &[u8; 16], msg: &[u8]) -> Result<(), PairingError> {
+        match self {
+            RelayTransport::Fs(r) => r.put_receiver_message(room_id, msg),
+            RelayTransport::Http(r) => r.put_receiver_message(room_id, msg),
+        }
+    }
+
+    fn consume_room(&mut self, room_id: &[u8; 16]) -> Result<(), PairingError> {
+        match self {
+            RelayTransport::Fs(r) => r.consume_room(room_id),
+            RelayTransport::Http(r) => r.consume_room(room_id),
+        }
+    }
+}
+
 /// Runs the sender side of SPAKE2 + mailbox exchange.
 pub fn sender_derive_session_secrets(
     relay: &mut impl PairingRelay,
@@ -863,6 +1209,29 @@ mod tests {
         assert!(matches!(
             parsed.relay,
             RendezvousRelay::BeamFs(ref p) if p == &path
+        ));
+    }
+
+    #[test]
+    fn token_invite_accepts_whitespace_field_separators() {
+        let prepared =
+            prepare_invite_long_token(120, "http://127.0.0.1:9/").expect("prep");
+        let tab_line = prepared.invite_line.clone();
+        let parsed_tab = parse_invite_line(&tab_line).expect("tab parse");
+        let spaced = tab_line.replace('\t', "   ");
+        let parsed_spaced = parse_invite_line(&spaced).expect("whitespace parse");
+        assert_eq!(parsed_tab, parsed_spaced);
+    }
+
+    #[test]
+    fn word_http_invite_round_trips() {
+        let prepared =
+            prepare_invite_human_words_http(3600, "http://127.0.0.1:8787/").expect("prepare");
+        let parsed = parse_invite_line(&prepared.invite_line).expect("parse");
+        assert_eq!(parsed.room_id, prepared.room_id);
+        assert!(matches!(
+            parsed.relay,
+            RendezvousRelay::Http(ref u) if u == "http://127.0.0.1:8787"
         ));
     }
 

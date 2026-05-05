@@ -11,9 +11,9 @@ use beam_core::local_transfer::{
     transfer_one_file_local, transfer_one_file_local_encrypted, DestinationConflictPolicy,
 };
 use beam_core::pairing::{
-    parse_invite_line, prepare_invite_human_words, prepare_invite_long_token,
-    receiver_derive_session_secrets, sender_derive_session_secrets, FsRelay, RendezvousRelay,
-    RELAY_BEAM_FS_PREFIX,
+    parse_invite_line, prepare_invite_human_words, prepare_invite_human_words_http,
+    prepare_invite_long_token, receiver_derive_session_secrets, sender_derive_session_secrets,
+    RelayTransport, RELAY_BEAM_FS_PREFIX,
 };
 use beam_core::session_crypto::{InviteContext, SessionSecrets};
 use clap::{Parser, Subcommand};
@@ -29,9 +29,12 @@ struct Cli {
 enum Command {
     /// Prepare pairing, print an invite, then wait for a receiver (filesystem mailbox).
     Send {
-        /// Shared mailbox directory (must match the receiver's resolved relay path).
+        /// Shared mailbox directory (`beam-fs:` rendezvous); mutually exclusive with `--relay-url`.
         #[arg(long, value_name = "DIR")]
-        relay_dir: PathBuf,
+        relay_dir: Option<PathBuf>,
+        /// Base URL of `beam-relay` (`http://...`); mutually exclusive with `--relay-dir`.
+        #[arg(long, value_name = "URL")]
+        relay_url: Option<String>,
         /// Invite lifetime in seconds (rendezvous expiry metadata).
         #[arg(long, default_value_t = 3600)]
         ttl_secs: u64,
@@ -42,9 +45,9 @@ enum Command {
         #[arg(long, default_value_t = 600)]
         timeout_secs: u64,
     },
-    /// Accept an invite string and complete PAKE pairing via the filesystem mailbox.
+    /// Accept an invite string and complete PAKE pairing (filesystem or HTTP relay per invite).
     Recv {
-        /// Single-line invite (quote it if it contains spaces).
+        /// Full single-line invite (TAB-separated fields from `beam send`; quote as one argument).
         #[arg(value_name = "INVITE")]
         invite: String,
         /// Override mailbox directory when the invite uses relay kind `default`.
@@ -85,41 +88,40 @@ fn hex_session_id(id: &[u8; 16]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn fs_relay_for_invite(
-    parsed: &beam_core::pairing::ParsedInvite,
-    relay_override: Option<PathBuf>,
-) -> Result<FsRelay, String> {
-    match (&parsed.relay, relay_override) {
-        (RendezvousRelay::BeamFs(path), _) => Ok(FsRelay::new(path)),
-        (RendezvousRelay::Default, Some(path)) => Ok(FsRelay::new(path)),
-        (RendezvousRelay::Default, None) => Err(
-            "this invite uses relay kind \"default\"; pass --relay-dir pointing at the sender mailbox"
-                .to_owned(),
-        ),
-        (RendezvousRelay::Unsupported(url), _) => Err(format!(
-            "relay {url:?} is not supported by this CLI build (use beam-fs: paths)"
-        )),
-    }
-}
-
 fn main() {
     let cli = Cli::parse();
     match cli.command {
         Command::Send {
             relay_dir,
+            relay_url,
             ttl_secs,
             human_words,
             timeout_secs,
         } => {
-            std::fs::create_dir_all(&relay_dir).unwrap_or_else(|e| {
-                eprintln!("beam send: cannot create relay dir: {e}");
-                std::process::exit(1);
-            });
-            let prepared = if human_words {
-                prepare_invite_human_words(ttl_secs, &relay_dir)
-            } else {
-                let url = format!("{}{}", RELAY_BEAM_FS_PREFIX, relay_dir.display());
-                prepare_invite_long_token(ttl_secs, &url)
+            let prepared = match (relay_dir.as_ref(), relay_url.as_ref()) {
+                (Some(dir), None) => {
+                    std::fs::create_dir_all(dir).unwrap_or_else(|e| {
+                        eprintln!("beam send: cannot create relay dir: {e}");
+                        std::process::exit(1);
+                    });
+                    if human_words {
+                        prepare_invite_human_words(ttl_secs, dir)
+                    } else {
+                        let url = format!("{}{}", RELAY_BEAM_FS_PREFIX, dir.display());
+                        prepare_invite_long_token(ttl_secs, &url)
+                    }
+                }
+                (None, Some(url)) => {
+                    if human_words {
+                        prepare_invite_human_words_http(ttl_secs, url)
+                    } else {
+                        prepare_invite_long_token(ttl_secs, url)
+                    }
+                }
+                _ => {
+                    eprintln!("beam send: specify exactly one of --relay-dir or --relay-url");
+                    std::process::exit(1);
+                }
             };
             let prepared = prepared.unwrap_or_else(|e| {
                 eprintln!("beam send: {e}");
@@ -127,7 +129,10 @@ fn main() {
             });
             println!("{}", prepared.invite_line);
             std::io::stdout().flush().unwrap_or(());
-            let mut relay = FsRelay::new(relay_dir);
+            let mut relay = RelayTransport::for_sender_prepare(&prepared).unwrap_or_else(|e| {
+                eprintln!("beam send: {e}");
+                std::process::exit(1);
+            });
             let secrets = sender_derive_session_secrets(
                 &mut relay,
                 &prepared,
@@ -155,7 +160,7 @@ fn main() {
                 eprintln!("beam recv: {e}");
                 std::process::exit(1);
             });
-            let mut relay = fs_relay_for_invite(&parsed, relay_dir).unwrap_or_else(|e| {
+            let mut relay = RelayTransport::for_receiver(&parsed, relay_dir).unwrap_or_else(|e| {
                 eprintln!("beam recv: {e}");
                 std::process::exit(1);
             });
@@ -247,11 +252,33 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Send {
-                relay_dir,
+                relay_dir: Some(dir),
+                relay_url: None,
                 ttl_secs: 3600,
                 human_words: false,
                 timeout_secs: 600,
-            } if relay_dir == Path::new("C:\\beam\\mb")
+            } if dir == Path::new("C:\\beam\\mb")
+        ));
+    }
+
+    #[test]
+    fn cli_parses_send_with_relay_url() {
+        let cli = Cli::try_parse_from([
+            "beam",
+            "send",
+            "--relay-url",
+            "http://127.0.0.1:8787/",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Send {
+                relay_dir: None,
+                relay_url: Some(ref url),
+                ttl_secs: 3600,
+                human_words: false,
+                timeout_secs: 600,
+            } if url == "http://127.0.0.1:8787/"
         ));
     }
 

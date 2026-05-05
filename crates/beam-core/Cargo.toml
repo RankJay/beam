@@ -17,6 +17,7 @@ hkdf = "0.12.4"
 rand = "0.9.4"
 sha2 = "0.10.9"
 spake2 = "0.4"
+ureq = "3.2.1"
 zeroize = "1.8.2"
 
 [dev-dependencies]
