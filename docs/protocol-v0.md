@@ -61,10 +61,14 @@ v1 manifests bind chunk hashes; transfer applies AEAD over control + chunk envel
 
 | User action | Implementation anchor |
 |-------------|------------------------|
-| Default send | `beam send` → `resolved_public_relay_base_url()` embedded in invite |
-| Custom relay | `--relay-url` or token/`http` human-word URL |
-| FS mailbox | `--relay-dir` / `beam-fs:` in invite |
-| Resume | Structured JSON session files under data dir (`beam paths`) |
+| Default send + file | `beam send FILE` → pairing → `provide_one_file_with_relay_fallback` (QUIC + relay pipe) |
+| Recv file | `beam recv INVITE DEST` → pairing → `receive_one_file_with_relay_fallback` using sender's `quic_connect=` |
+| Default invite | `beam send` → `resolved_public_relay_base_url()` embedded in invite |
+| Custom relay | `--relay-url` or token / `http` human-word URL |
+| FS mailbox | `--relay-dir` / `beam-fs:` in invite (pairing only; pipe requires HTTP relay) |
+| Folder tree | **`beam local-transfer-folder` only** (no network folder MVP) |
+| Resume | `LocalSessionFileV1` under `beam paths` / `sessions_dir` |
+| Staging cleanup | `beam session-cleanup --clean-staging` for terminal sessions |
 
 ## Troubleshooting matrix
 

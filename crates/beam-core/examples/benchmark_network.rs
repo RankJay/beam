@@ -1,14 +1,17 @@
-//! Phase 6: when direct QUIC cannot complete in time, encrypted transfer falls back to the relay blind pipe.
+//! Print timing for one encrypted file over [`beam_core::direct_quic::transfer_one_file_with_relay_fallback_blocking`]
+//! (same stack as `tests/relay_fallback_one_file.rs`).
+//!
+//! Run: `cargo run -p beam-core --example benchmark_network --locked`
 
 #![forbid(unsafe_code)]
 
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use beam_core::direct_quic::{
-    transfer_one_file_with_relay_fallback_blocking, DirectQuicEvent, DirectQuicTransferReceipt,
-    RelayPipeConfig, TransferPathSurface,
+    transfer_one_file_with_relay_fallback_blocking, DirectQuicTransferReceipt, RelayPipeConfig,
+    TransferPathSurface,
 };
 use beam_core::local_transfer::DestinationConflictPolicy;
 use beam_core::session_crypto::{HandshakeBinding, InviteContext, SessionSecrets};
@@ -23,8 +26,7 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-#[test]
-fn encrypted_one_file_transfer_relay_fallback_when_direct_skipped() {
+fn main() {
     let dir = TempDir::new().expect("temp");
     let staging_dir = TempDir::new().expect("staging");
     let secrets = SessionSecrets::pairing_shim_local();
@@ -42,17 +44,17 @@ fn encrypted_one_file_transfer_relay_fallback_when_direct_skipped() {
             .await
             .expect("serve");
     });
-    std::thread::sleep(Duration::from_millis(60));
+    std::thread::sleep(Duration::from_millis(80));
 
-    let src = dir.path().join("r.bin");
-    let body: Vec<u8> = (0_u8..=211).cycle().take(900).collect();
+    let src = dir.path().join("bench.bin");
+    let body: Vec<u8> = (0_u8..=211).cycle().take(900_000).collect();
     fs::write(&src, &body).expect("write");
 
-    let dest = dir.path().join("out-r.bin");
-    let staging = staging_dir.path().join("st-r.bin");
+    let dest = dir.path().join("out-bench.bin");
+    let staging = staging_dir.path().join("st-bench.bin");
     let binding = HandshakeBinding {
         invite: InviteContext::default(),
-        chunk_size: 64,
+        chunk_size: 64 * 1024,
         framing_version: 1,
     };
 
@@ -63,33 +65,30 @@ fn encrypted_one_file_transfer_relay_fallback_when_direct_skipped() {
         gate,
     };
 
+    let t0 = Instant::now();
     let receipt: DirectQuicTransferReceipt = transfer_one_file_with_relay_fallback_blocking(
         &secrets,
         binding,
         &src,
         &staging,
         &dest,
-        "r.bin",
+        "bench.bin",
         DestinationConflictPolicy::FailIfExists,
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         relay,
         Duration::from_millis(0),
     )
-    .expect("relay fallback transfer");
+    .expect("transfer");
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     assert_eq!(receipt.path, TransferPathSurface::Relayed);
-    assert_eq!(fs::read(&dest).expect("read dest"), body);
-    assert!(
-        receipt.relay_phase_ms.is_some(),
-        "expected relay phase timing on receipt: {:?}",
-        receipt.relay_phase_ms
-    );
-    assert!(
-        receipt
-            .events
-            .iter()
-            .any(|e| matches!(e, DirectQuicEvent::DirectPathAbandoned { .. })),
-        "expected DirectPathAbandoned in {:?}",
-        receipt.events
+    assert_eq!(fs::read(&dest).expect("read dest").len(), body.len());
+
+    println!(
+        "benchmark_network: relay-only, {} bytes, chunk_size={}, total_ms={:.2}, path={:?}",
+        body.len(),
+        binding.chunk_size,
+        ms,
+        receipt.path
     );
 }

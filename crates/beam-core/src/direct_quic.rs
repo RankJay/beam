@@ -4,12 +4,13 @@
 //! [`crate::session_crypto`] with distinct AEAD keys (ADR 0084). Chunk Blake3 commitments stay independent of QUIC crypto (ADR 0080).
 
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
 use std::time::Duration;
 
-use crate::pairing::room_id_hex;
+use crate::pairing::{room_id_hex, RendezvousRelay};
+use crate::relay_default::resolved_public_relay_base_url;
 
 use quinn::{Connecting, Endpoint, RecvStream, SendStream};
 use rcgen::{generate_simple_self_signed, CertifiedKey};
@@ -273,6 +274,30 @@ pub fn loopback_connect_addr(advertised: SocketAddr) -> SocketAddr {
         }
         other => other,
     }
+}
+
+/// Address receivers should dial for QUIC (LAN overrides, else loopback substitution for `0.0.0.0` binds).
+pub fn quic_connect_hint_for_cli(
+    dial_loopback: SocketAddr,
+    advertise: Option<&str>,
+) -> Result<SocketAddr, TransferError> {
+    let Some(ad) = advertise else {
+        return Ok(dial_loopback);
+    };
+    if let Ok(addr) = ad.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = ad.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, dial_loopback.port()));
+    }
+    let mut addrs = (ad, dial_loopback.port())
+        .to_socket_addrs()
+        .map_err(|_| TransferError::DirectQuicTransport("cannot resolve --advertise host"))?;
+    addrs
+        .next()
+        .ok_or(TransferError::DirectQuicTransport(
+            "no addresses for --advertise host",
+        ))
 }
 
 /// Receiver finished all chunks and finalized; or paused with [`LocalReceiver`] for persistence.
@@ -682,6 +707,40 @@ pub struct RelayPipeConfig {
     pub gate: [u8; 32],
 }
 
+impl RelayPipeConfig {
+    /// Build pipe credentials for the HTTP(S) relay paired with this invite.
+    ///
+    /// Filesystem mailboxes (`beam-fs:`) cannot carry the blind pipe; use default or `--relay-url`.
+    pub fn for_paired_invite(
+        relay: &RendezvousRelay,
+        room_id: [u8; 16],
+        expires_unix: u64,
+        secrets: &SessionSecrets,
+    ) -> Result<Self, TransferError> {
+        let base_url = match relay {
+            RendezvousRelay::Http(u) => crate::pairing::normalize_http_relay_base(u),
+            RendezvousRelay::Default => resolved_public_relay_base_url(),
+            RendezvousRelay::BeamFs(_) => {
+                return Err(TransferError::RelayPipe(
+                    "filesystem mailbox cannot carry the encrypted pipe; use default relay or --relay-url http(s)",
+                ));
+            }
+            RendezvousRelay::Unsupported(_) => {
+                return Err(TransferError::RelayPipe(
+                    "invite relay is not supported for encrypted file transfer",
+                ));
+            }
+        };
+        let gate = secrets.relay_pipe_gate_token(&room_id)?;
+        Ok(Self {
+            base_url,
+            room_id,
+            expires_unix,
+            gate,
+        })
+    }
+}
+
 fn gate_hex_bytes(gate: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(64);
@@ -1021,85 +1080,53 @@ async fn provider_either_quic_or_relay(
     }
 }
 
+/// Sender half: QUIC listener plus relay fallback (receiver runs [`receive_one_file_with_relay_fallback`]).
 #[allow(clippy::too_many_arguments)]
-pub fn transfer_one_file_with_relay_fallback_blocking(
-    secrets: &SessionSecrets,
-    _invite: InviteContext,
+pub async fn provide_one_file_with_relay_fallback(
+    secrets: SessionSecrets,
     binding: HandshakeBinding,
-    source: &Path,
-    staging: &Path,
-    destination: &Path,
-    relative_path: &str,
-    conflict: DestinationConflictPolicy,
+    source: PathBuf,
+    relative_path: String,
     provider_listen: SocketAddr,
     relay: RelayPipeConfig,
     direct_timeout: Duration,
-) -> Result<DirectQuicTransferReceipt, TransferError> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|_| TransferError::DirectQuicTransport("tokio runtime init failed"))?;
-    rt.block_on(transfer_one_file_with_relay_fallback(
+    ready_tx: oneshot::Sender<SocketAddr>,
+    log: Arc<std::sync::Mutex<Vec<DirectQuicEvent>>>,
+) -> Result<TransferPathSurface, TransferError> {
+    install_ring_crypto_provider()?;
+    let (server_cfg, _client_cfg) = development_localhost_quinn()?;
+    provider_either_quic_or_relay(
+        server_cfg,
+        provider_listen,
         secrets,
         binding,
         source,
-        staging,
-        destination,
         relative_path,
-        conflict,
-        provider_listen,
+        ready_tx,
+        log,
         relay,
         direct_timeout,
-    ))
+    )
+    .await
 }
 
+/// Receiver half: dial the QUIC address advertised by the provider, then direct-first + relay fallback.
 #[allow(clippy::too_many_arguments)]
-pub async fn transfer_one_file_with_relay_fallback(
+pub async fn receive_one_file_with_relay_fallback(
     secrets: &SessionSecrets,
     binding: HandshakeBinding,
-    source: &Path,
+    client_cfg: quinn::ClientConfig,
+    connect_target: SocketAddr,
     staging: &Path,
     destination: &Path,
-    relative_path: &str,
     conflict: DestinationConflictPolicy,
-    provider_listen: SocketAddr,
     relay: RelayPipeConfig,
     direct_timeout: Duration,
+    events: Arc<std::sync::Mutex<Vec<DirectQuicEvent>>>,
 ) -> Result<DirectQuicTransferReceipt, TransferError> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
-
-    install_ring_crypto_provider()?;
-    let (server_cfg, client_cfg) = development_localhost_quinn()?;
-
-    let events: Arc<std::sync::Mutex<Vec<DirectQuicEvent>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
-
-    let source_pb = source.to_path_buf();
-    let rel = relative_path.to_owned();
-    let secrets_clone = secrets.clone();
-    let log_prov = Arc::clone(&events);
-    let relay_clone = relay.clone();
-
-    let provider_task = tokio::spawn(async move {
-        provider_either_quic_or_relay(
-            server_cfg,
-            provider_listen,
-            secrets_clone,
-            binding,
-            source_pb,
-            rel,
-            ready_tx,
-            log_prov,
-            relay_clone,
-            direct_timeout,
-        )
-        .await
-    });
-
-    let connect_target = ready_rx.await.map_err(|_| {
-        TransferError::DirectQuicTransport("provider never reported listen address")
-    })?;
 
     events
         .lock()
@@ -1220,16 +1247,6 @@ pub async fn transfer_one_file_with_relay_fallback(
         }
     }
 
-    let provider_path = provider_task
-        .await
-        .map_err(|_| TransferError::DirectQuicTransport("provider task join failed"))??;
-
-    if provider_path != path {
-        return Err(TransferError::WireProtocol(
-            "provider and receiver disagreed on transfer path (direct vs relay)",
-        ));
-    }
-
     let diagnostics = events.lock().expect("diag").clone();
 
     Ok(DirectQuicTransferReceipt {
@@ -1239,6 +1256,177 @@ pub async fn transfer_one_file_with_relay_fallback(
         direct_attempt_ms: direct_ms,
         relay_phase_ms: relay_ms,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn provide_one_file_with_relay_fallback_blocking(
+    secrets: &SessionSecrets,
+    binding: HandshakeBinding,
+    source: &Path,
+    relative_path: &str,
+    provider_listen: SocketAddr,
+    relay: RelayPipeConfig,
+    direct_timeout: Duration,
+    mut on_connect_target: impl FnMut(SocketAddr),
+) -> Result<TransferPathSurface, TransferError> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|_| TransferError::DirectQuicTransport("tokio runtime init failed"))?;
+    rt.block_on(async {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let task = tokio::spawn(provide_one_file_with_relay_fallback(
+            secrets.clone(),
+            binding,
+            source.to_path_buf(),
+            relative_path.to_owned(),
+            provider_listen,
+            relay,
+            direct_timeout,
+            ready_tx,
+            log,
+        ));
+        let connect_target = ready_rx.await.map_err(|_| {
+            TransferError::DirectQuicTransport("provider never reported listen address")
+        })?;
+        on_connect_target(connect_target);
+        task.await
+            .map_err(|_| TransferError::DirectQuicTransport("provider task join failed"))?
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn receive_one_file_with_relay_fallback_blocking(
+    secrets: &SessionSecrets,
+    binding: HandshakeBinding,
+    connect_target: SocketAddr,
+    staging: &Path,
+    destination: &Path,
+    conflict: DestinationConflictPolicy,
+    relay: RelayPipeConfig,
+    direct_timeout: Duration,
+) -> Result<DirectQuicTransferReceipt, TransferError> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|_| TransferError::DirectQuicTransport("tokio runtime init failed"))?;
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    rt.block_on(async {
+        install_ring_crypto_provider()?;
+        let (_server_cfg, client_cfg) = development_localhost_quinn()?;
+        receive_one_file_with_relay_fallback(
+            secrets,
+            binding,
+            client_cfg,
+            connect_target,
+            staging,
+            destination,
+            conflict,
+            relay,
+            direct_timeout,
+            events,
+        )
+        .await
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn transfer_one_file_with_relay_fallback_blocking(
+    secrets: &SessionSecrets,
+    binding: HandshakeBinding,
+    source: &Path,
+    staging: &Path,
+    destination: &Path,
+    relative_path: &str,
+    conflict: DestinationConflictPolicy,
+    provider_listen: SocketAddr,
+    relay: RelayPipeConfig,
+    direct_timeout: Duration,
+) -> Result<DirectQuicTransferReceipt, TransferError> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|_| TransferError::DirectQuicTransport("tokio runtime init failed"))?;
+    rt.block_on(transfer_one_file_with_relay_fallback(
+        secrets,
+        binding,
+        source,
+        staging,
+        destination,
+        relative_path,
+        conflict,
+        provider_listen,
+        relay,
+        direct_timeout,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn transfer_one_file_with_relay_fallback(
+    secrets: &SessionSecrets,
+    binding: HandshakeBinding,
+    source: &Path,
+    staging: &Path,
+    destination: &Path,
+    relative_path: &str,
+    conflict: DestinationConflictPolicy,
+    provider_listen: SocketAddr,
+    relay: RelayPipeConfig,
+    direct_timeout: Duration,
+) -> Result<DirectQuicTransferReceipt, TransferError> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    install_ring_crypto_provider()?;
+    let (_server_cfg, client_cfg) = development_localhost_quinn()?;
+
+    let events: Arc<std::sync::Mutex<Vec<DirectQuicEvent>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
+
+    let source_pb = source.to_path_buf();
+    let rel = relative_path.to_owned();
+    let secrets_clone = secrets.clone();
+    let log_prov = Arc::clone(&events);
+    let relay_clone = relay.clone();
+
+    let provider_task = tokio::spawn(provide_one_file_with_relay_fallback(
+        secrets_clone,
+        binding,
+        source_pb,
+        rel,
+        provider_listen,
+        relay_clone,
+        direct_timeout,
+        ready_tx,
+        log_prov,
+    ));
+
+    let connect_target = ready_rx.await.map_err(|_| {
+        TransferError::DirectQuicTransport("provider never reported listen address")
+    })?;
+
+    let receipt = receive_one_file_with_relay_fallback(
+        secrets,
+        binding,
+        client_cfg,
+        connect_target,
+        staging,
+        destination,
+        conflict,
+        relay,
+        direct_timeout,
+        events,
+    )
+    .await?;
+
+    let provider_path = provider_task
+        .await
+        .map_err(|_| TransferError::DirectQuicTransport("provider task join failed"))??;
+
+    if provider_path != receipt.path {
+        return Err(TransferError::WireProtocol(
+            "provider and receiver disagreed on transfer path (direct vs relay)",
+        ));
+    }
+
+    Ok(receipt)
 }
 
 /// One QUIC leg on the provider: bind, accept, framed manifest + chunk responses.

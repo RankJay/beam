@@ -200,6 +200,7 @@ name = "beam-cli"
 version = "0.1.0"
 dependencies = [
  "beam-core",
+ "blake3",
  "clap",
  "clap_complete",
  "serde",

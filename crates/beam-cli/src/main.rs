@@ -2,12 +2,17 @@
 
 #![forbid(unsafe_code)]
 
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use beam_core::chunking::DEFAULT_CHUNK_SIZE;
-use beam_core::direct_quic::{framed_transfer_receiver_quic_leg_blocking, ReceiverSessionOutcome};
+use beam_core::direct_quic::{
+    framed_transfer_receiver_quic_leg_blocking, provide_one_file_with_relay_fallback_blocking,
+    quic_connect_hint_for_cli, receive_one_file_with_relay_fallback_blocking,
+    ReceiverSessionOutcome, TransferPathSurface,
+};
 use beam_core::folder_snapshot::{
     build_folder_snapshot_manifest, transfer_folder_snapshot_local, SnapshotFilters,
 };
@@ -20,7 +25,7 @@ use beam_core::pairing::{
     prepare_invite_long_token, receiver_derive_session_secrets, sender_derive_session_secrets,
     RelayTransport, RELAY_BEAM_FS_PREFIX,
 };
-use beam_core::session_crypto::{InviteContext, SessionSecrets};
+use beam_core::session_crypto::{HandshakeBinding, InviteContext, SessionSecrets};
 use beam_core::session_file::{LocalSessionFileV1, PersistedTransferState};
 use beam_core::{beam_cache_dir, beam_data_dir, beam_sessions_dir};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -41,8 +46,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Prepare pairing, print an invite, then wait for a receiver (filesystem or HTTP relay).
+    /// Prepare pairing, print an invite, wait for a receiver, then send one file (omit FILE for invite-only / pairing smoke).
     Send {
+        /// Source file to send after pairing (omit for invite-only).
+        #[arg(value_name = "FILE")]
+        file: Option<PathBuf>,
         /// When both this and `--relay-url` are omitted, uses the built-in alpha relay URL (`DEFAULT_PUBLIC_RELAY_BASE_URL`), overridable with `BEAM_RELAY_URL`.
         #[arg(long, value_name = "DIR")]
         relay_dir: Option<PathBuf>,
@@ -51,6 +59,18 @@ enum Command {
         /// When both this and `--relay-dir` are omitted, uses the same default as above.
         #[arg(long, value_name = "URL")]
         relay_url: Option<String>,
+        /// Bind address for QUIC provider (`host:port`). Default `0.0.0.0:0`.
+        #[arg(long, value_name = "ADDR")]
+        listen: Option<SocketAddr>,
+        /// If set, receiver should dial this host (or `host:port`) instead of loopback; use for LAN (sender prints `quic_connect=…`).
+        #[arg(long, value_name = "HOST_OR_ADDR")]
+        advertise: Option<String>,
+        /// Max wait for direct QUIC before falling back to relay (milliseconds).
+        #[arg(long, default_value_t = 8000)]
+        direct_timeout_ms: u64,
+        /// Chunk size for manifest / transfer (default from core).
+        #[arg(long, value_name = "BYTES")]
+        chunk_size: Option<u64>,
         /// Invite lifetime in seconds (rendezvous expiry metadata).
         #[arg(long, default_value_t = 3600)]
         ttl_secs: u64,
@@ -61,14 +81,29 @@ enum Command {
         #[arg(long, default_value_t = 600)]
         timeout_secs: u64,
     },
-    /// Accept an invite string and complete PAKE pairing (filesystem or HTTP relay per invite).
+    /// Accept an invite string, pair, then receive one file into DEST (omit DEST for pairing-only).
     Recv {
         /// Full single-line invite (TAB-separated fields from `beam send`; quote as one argument).
         #[arg(value_name = "INVITE")]
         invite: String,
+        /// Output file path (created). Omit for pairing-only.
+        #[arg(value_name = "DEST")]
+        dest: Option<PathBuf>,
+        /// QUIC `host:port` printed by the sender as `quic_connect=…`. If omitted in human mode, read interactively from stdin.
+        #[arg(long)]
+        provider: Option<SocketAddr>,
         /// Use this mailbox directory instead of the default HTTP relay when the invite relay kind is `default`.
         #[arg(long, value_name = "DIR")]
         relay_dir: Option<PathBuf>,
+        /// Staging path (default: `DEST` with `.beam-staging` next to it).
+        #[arg(long, value_name = "PATH")]
+        staging: Option<PathBuf>,
+        /// Chunk size (must match sender manifest; default from core).
+        #[arg(long, value_name = "BYTES")]
+        chunk_size: Option<u64>,
+        /// Max wait for direct QUIC before relay fallback (milliseconds).
+        #[arg(long, default_value_t = 8000)]
+        direct_timeout_ms: u64,
         #[arg(long, default_value_t = 600)]
         timeout_secs: u64,
     },
@@ -143,6 +178,9 @@ enum Command {
         dir: Option<PathBuf>,
         #[arg(long)]
         dry_run: bool,
+        /// Best-effort delete the staging file recorded in each removed session (terminal states only).
+        #[arg(long)]
+        clean_staging: bool,
     },
     /// Benchmark local plaintext transfer latency (same pipeline as `local-transfer`).
     BenchmarkLocal {
@@ -191,6 +229,43 @@ fn exit_cli(json: bool, command: &'static str, msg: impl std::fmt::Display) -> !
     std::process::exit(1);
 }
 
+fn path_surface_json(p: TransferPathSurface) -> &'static str {
+    match p {
+        TransferPathSurface::Direct => "direct",
+        TransferPathSurface::Relayed => "relayed",
+    }
+}
+
+fn resolve_recv_provider(cli_provider: Option<SocketAddr>, json_mode: bool) -> SocketAddr {
+    if let Some(a) = cli_provider {
+        return a;
+    }
+    if json_mode {
+        exit_cli(true, "recv", "--provider is required with --json");
+    }
+    if !io::stdin().is_terminal() {
+        exit_cli(
+            false,
+            "recv",
+            "--provider is required when stdin is not a terminal",
+        );
+    }
+    eprint!("QUIC address from sender (quic_connect= line): ");
+    io::stdout().flush().unwrap_or(());
+    let mut line = String::new();
+    io::stdin().read_line(&mut line).unwrap_or_else(|e| {
+        exit_cli(false, "recv", format!("stdin: {e}"));
+    });
+    let line = line.trim();
+    line.parse().unwrap_or_else(|_| {
+        exit_cli(
+            false,
+            "recv",
+            "invalid provider address (expected host:port)",
+        );
+    })
+}
+
 fn main() {
     let cli = Cli::parse();
     let json = cli.json;
@@ -201,8 +276,13 @@ fn main() {
             generate(shell, &mut cmd, "beam", &mut std::io::stdout());
         }
         Command::Send {
+            file,
             relay_dir,
             relay_url,
+            listen,
+            advertise,
+            direct_timeout_ms,
+            chunk_size,
             ttl_secs,
             human_words,
             timeout_secs,
@@ -260,37 +340,191 @@ fn main() {
                 std::process::exit(1);
             });
             eprintln!(
-                "paired: resume lives in session material (session_id={})",
+                "paired: session_id={}",
                 hex_session_id(&secrets.session_id)
             );
+
+            let Some(ref file_path) = file else {
+                if json {
+                    print_json_value(serde_json::json!({
+                        "ok": true,
+                        "command": "send",
+                        "phase": "paired",
+                        "session_id_hex": hex_session_id(&secrets.session_id),
+                    }));
+                }
+                return;
+            };
+
+            if !file_path.is_file() {
+                exit_cli(
+                    json,
+                    "send",
+                    format!("{} is not a file (folders over the network are not supported; use beam local-transfer-folder)", file_path.display()),
+                );
+            }
+
+            let chunk_size = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
+            let binding = HandshakeBinding {
+                invite: prepared.invite_context(),
+                chunk_size,
+                framing_version: 1,
+            };
+            let relay_cfg = beam_core::direct_quic::RelayPipeConfig::for_paired_invite(
+                &prepared.relay,
+                prepared.room_id,
+                prepared.expires_unix,
+                &secrets,
+            )
+            .unwrap_or_else(|e| exit_cli(json, "send", e));
+
+            let relative = file_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file")
+                .to_owned();
+
+            let listen = listen.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+            let direct_timeout = Duration::from_millis(direct_timeout_ms);
+
+            let hint_slot = std::sync::Mutex::new(None::<Result<SocketAddr, beam_core::TransferError>>);
+            let surface = provide_one_file_with_relay_fallback_blocking(
+                &secrets,
+                binding,
+                file_path,
+                &relative,
+                listen,
+                relay_cfg,
+                direct_timeout,
+                |connect_loopback| {
+                    let hint = quic_connect_hint_for_cli(connect_loopback, advertise.as_deref());
+                    if !json {
+                        match &hint {
+                            Ok(addr) => eprintln!("quic_connect={addr}"),
+                            Err(_) => {}
+                        }
+                    }
+                    *hint_slot.lock().expect("hint mutex") = Some(hint);
+                },
+            );
+
+            let surface = surface.unwrap_or_else(|e| exit_cli(json, "send", e));
+            match hint_slot
+                .into_inner()
+                .expect("mutex")
+                .expect("provider must report address")
+            {
+                Err(e) => exit_cli(json, "send", e),
+                Ok(_) => {}
+            }
+
+            if json {
+                print_json_value(serde_json::json!({
+                    "ok": true,
+                    "command": "send",
+                    "phase": "transfer_complete",
+                    "session_id_hex": hex_session_id(&secrets.session_id),
+                    "path": path_surface_json(surface),
+                    "source": file_path,
+                }));
+            } else {
+                eprintln!("send: done ({})", path_surface_json(surface));
+            }
         }
         Command::Recv {
             invite,
+            dest,
+            provider,
             relay_dir,
+            staging,
+            chunk_size,
+            direct_timeout_ms,
             timeout_secs,
         } => {
             let parsed = parse_invite_line(&invite).unwrap_or_else(|e| {
-                eprintln!("beam recv: {e}");
-                std::process::exit(1);
+                exit_cli(json, "recv", e);
             });
             parsed.assert_not_expired().unwrap_or_else(|e| {
-                eprintln!("beam recv: {e}");
-                std::process::exit(1);
+                exit_cli(json, "recv", e);
             });
-            let mut relay = RelayTransport::for_receiver(&parsed, relay_dir).unwrap_or_else(|e| {
-                eprintln!("beam recv: {e}");
-                std::process::exit(1);
+            let mut rendezvous = RelayTransport::for_receiver(&parsed, relay_dir).unwrap_or_else(|e| {
+                exit_cli(json, "recv", e);
             });
             let secrets = receiver_derive_session_secrets(
-                &mut relay,
+                &mut rendezvous,
                 &parsed,
                 Duration::from_secs(timeout_secs),
             )
             .unwrap_or_else(|e| {
-                eprintln!("beam recv: pairing failed: {e}");
-                std::process::exit(1);
+                exit_cli(json, "recv", format!("pairing failed: {e}"));
             });
-            println!("paired session_id={}", hex_session_id(&secrets.session_id));
+
+            let Some(ref dest_path) = dest else {
+                if json {
+                    print_json_value(serde_json::json!({
+                        "ok": true,
+                        "command": "recv",
+                        "phase": "paired",
+                        "session_id_hex": hex_session_id(&secrets.session_id),
+                    }));
+                } else {
+                    println!("paired session_id={}", hex_session_id(&secrets.session_id));
+                }
+                return;
+            };
+
+            let chunk_size = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
+            let binding = HandshakeBinding {
+                invite: parsed.invite_context(),
+                chunk_size,
+                framing_version: 1,
+            };
+            let relay_cfg = beam_core::direct_quic::RelayPipeConfig::for_paired_invite(
+                &parsed.relay,
+                parsed.room_id,
+                parsed.expires_unix,
+                &secrets,
+            )
+            .unwrap_or_else(|e| exit_cli(json, "recv", e));
+
+            let connect_to = resolve_recv_provider(provider, json);
+            let staging = staging.unwrap_or_else(|| default_staging_path(dest_path));
+            let direct_timeout = Duration::from_millis(direct_timeout_ms);
+
+            let receipt = receive_one_file_with_relay_fallback_blocking(
+                &secrets,
+                binding,
+                connect_to,
+                &staging,
+                dest_path,
+                DestinationConflictPolicy::FailIfExists,
+                relay_cfg,
+                direct_timeout,
+            )
+            .unwrap_or_else(|e| exit_cli(json, "recv", e));
+
+            let file_digest_hex = std::fs::read(dest_path)
+                .ok()
+                .map(|b| format!("{}", blake3::hash(&b)));
+
+            if json {
+                print_json_value(serde_json::json!({
+                    "ok": true,
+                    "command": "recv",
+                    "phase": "transfer_complete",
+                    "session_id_hex": hex_session_id(&secrets.session_id),
+                    "path": path_surface_json(receipt.path),
+                    "destination": dest_path,
+                    "staging": staging,
+                    "file_blake3_hex": file_digest_hex,
+                }));
+            } else {
+                eprintln!(
+                    "recv: wrote {} ({})",
+                    dest_path.display(),
+                    path_surface_json(receipt.path)
+                );
+            }
         }
         Command::LocalTransfer {
             from,
@@ -458,15 +692,27 @@ fn main() {
                         eprintln!("beam resume: transfer completed.");
                     }
                 }
-                ReceiverSessionOutcome::Paused { .. } => {
+                ReceiverSessionOutcome::Paused { receiver: paused_recv } => {
+                    let mut updated = loaded;
+                    updated.next_connection_serial = updated.next_connection_serial.saturating_add(1);
+                    updated.chunk_received = paused_recv.chunk_received_flags().to_vec();
+                    updated.transfer_state = PersistedTransferState::Paused;
+                    updated.save(&session).unwrap_or_else(|e| {
+                        eprintln!("beam resume: {e}");
+                        std::process::exit(1);
+                    });
                     if json {
                         print_json_value(serde_json::json!({
                             "ok": true,
                             "command": "resume",
                             "outcome": "paused",
+                            "session_path": session,
                         }));
                     } else {
-                        eprintln!("beam resume: paused again; update session file support is manual for now.");
+                        eprintln!(
+                            "beam resume: paused again; updated {}",
+                            session.display()
+                        );
                     }
                 }
             }
@@ -607,7 +853,11 @@ fn main() {
                 eprintln!("removed {}", path.display());
             }
         }
-        Command::SessionCleanup { dir, dry_run } => {
+        Command::SessionCleanup {
+            dir,
+            dry_run,
+            clean_staging,
+        } => {
             let root = dir.unwrap_or_else(beam_sessions_dir);
             let Ok(read) = std::fs::read_dir(&root) else {
                 exit_cli(json, "session-cleanup", "cannot read sessions directory");
@@ -647,6 +897,12 @@ fn main() {
                         println!("would remove {}", p.display());
                     }
                     continue;
+                }
+                if clean_staging {
+                    let st = s.staging_path_buf();
+                    if st.is_file() {
+                        let _ = std::fs::remove_file(&st);
+                    }
                 }
                 if let Err(e) = std::fs::remove_file(&p) {
                     exit_cli(json, "session-cleanup", format!("{}: {e}", p.display()));
@@ -814,12 +1070,31 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Send {
-                relay_dir: Some(dir),
+                file: None,
+                relay_dir: Some(ref dir),
                 relay_url: None,
+                listen: None,
+                advertise: None,
+                direct_timeout_ms: 8000,
+                chunk_size: None,
                 ttl_secs: 3600,
                 human_words: false,
                 timeout_secs: 600,
             } if dir == Path::new("C:\\beam\\mb")
+        ));
+    }
+
+    #[test]
+    fn cli_parses_send_with_file() {
+        let cli = Cli::try_parse_from(["beam", "send", "C:\\data\\x.bin"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Send {
+                file: Some(ref f),
+                relay_dir: None,
+                relay_url: None,
+                ..
+            } if f == Path::new("C:\\data\\x.bin")
         ));
     }
 
@@ -830,8 +1105,13 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Send {
+                file: None,
                 relay_dir: None,
                 relay_url: Some(ref url),
+                listen: None,
+                advertise: None,
+                direct_timeout_ms: 8000,
+                chunk_size: None,
                 ttl_secs: 3600,
                 human_words: false,
                 timeout_secs: 600,
@@ -845,12 +1125,45 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Send {
+                file: None,
                 relay_dir: None,
                 relay_url: None,
+                listen: None,
+                advertise: None,
+                direct_timeout_ms: 8000,
+                chunk_size: None,
                 ttl_secs: 3600,
                 human_words: false,
                 timeout_secs: 600,
             }
+        ));
+    }
+
+    #[test]
+    fn cli_parses_recv_with_dest() {
+        let cli = Cli::try_parse_from([
+            "beam",
+            "recv",
+            "beam-invite-v1\ttoken\tblob",
+            "C:\\out\\f.bin",
+            "--provider",
+            "127.0.0.1:9",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Recv {
+                ref invite,
+                ref dest,
+                provider: Some(a),
+                relay_dir: None,
+                staging: None,
+                chunk_size: None,
+                direct_timeout_ms: 8000,
+                timeout_secs: 600,
+            } if invite == "beam-invite-v1\ttoken\tblob"
+                && dest == &Some(PathBuf::from("C:\\out\\f.bin"))
+                && a.port() == 9
         ));
     }
 
