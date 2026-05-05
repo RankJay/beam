@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod chunking;
+pub mod direct_quic;
 mod error;
 pub mod local_transfer;
 pub mod manifest;

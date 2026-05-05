@@ -40,6 +40,10 @@ pub enum TransferError {
     ChunkEnvelopeAuthFailed,
     /// Control-plane envelope failed AEAD or used the wrong purpose key.
     ControlEnvelopeAuthFailed,
+    /// Invalid or oversized wire frame on QUIC application streams (ADR 0028 early fail).
+    WireProtocol(&'static str),
+    /// Direct QUIC bootstrap or transport-layer failure distinct from TLS at app layer (ADR 0006).
+    DirectQuicTransport(&'static str),
 }
 
 impl fmt::Display for TransferError {
@@ -97,6 +101,12 @@ impl fmt::Display for TransferError {
             }
             TransferError::ControlEnvelopeAuthFailed => {
                 write!(f, "control envelope authentication failed")
+            }
+            TransferError::WireProtocol(msg) => {
+                write!(f, "wire protocol framing error: {msg}")
+            }
+            TransferError::DirectQuicTransport(msg) => {
+                write!(f, "direct QUIC transport error: {msg}")
             }
         }
     }
