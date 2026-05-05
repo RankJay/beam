@@ -5,7 +5,10 @@
 use std::path::{Path, PathBuf};
 
 use beam_core::chunking::DEFAULT_CHUNK_SIZE;
-use beam_core::local_transfer::{transfer_one_file_local, DestinationConflictPolicy};
+use beam_core::local_transfer::{
+    transfer_one_file_local, transfer_one_file_local_encrypted, DestinationConflictPolicy,
+};
+use beam_core::session_crypto::{InviteContext, SessionSecrets};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -38,6 +41,9 @@ enum Command {
         /// Logical name stored in the manifest (defaults to `SOURCE` file name).
         #[arg(long)]
         relative_path: Option<String>,
+        /// Run through Phase 2 application-layer session crypto (shared secret is generated in-process; PAKE replaces this later).
+        #[arg(long)]
+        encrypted: bool,
     },
     /// Show core build identity (uses `beam-core`).
     Version,
@@ -64,6 +70,7 @@ fn main() {
             chunk_size,
             staging,
             relative_path,
+            encrypted,
         } => {
             let chunk_size = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
             let staging = staging.unwrap_or_else(|| default_staging_path(&to));
@@ -73,14 +80,29 @@ fn main() {
                     .unwrap_or("file")
                     .to_owned()
             });
-            if let Err(e) = transfer_one_file_local(
-                &from,
-                &staging,
-                &to,
-                &relative,
-                chunk_size,
-                DestinationConflictPolicy::FailIfExists,
-            ) {
+            let xfer = if encrypted {
+                let secrets = SessionSecrets::pairing_shim_local();
+                transfer_one_file_local_encrypted(
+                    &secrets,
+                    InviteContext::default(),
+                    &from,
+                    &staging,
+                    &to,
+                    &relative,
+                    chunk_size,
+                    DestinationConflictPolicy::FailIfExists,
+                )
+            } else {
+                transfer_one_file_local(
+                    &from,
+                    &staging,
+                    &to,
+                    &relative,
+                    chunk_size,
+                    DestinationConflictPolicy::FailIfExists,
+                )
+            };
+            if let Err(e) = xfer {
                 eprintln!("beam local-transfer: {e}");
                 std::process::exit(1);
             }
@@ -106,7 +128,9 @@ mod tests {
                 chunk_size: None,
                 staging: None,
                 relative_path: None,
-            } if from == Path::new("C:\\a\\in.txt") && to == Path::new("C:\\b\\out.txt")
+                encrypted: false,
+            }
+            if from == Path::new("C:\\a\\in.txt") && to == Path::new("C:\\b\\out.txt")
         ));
     }
 

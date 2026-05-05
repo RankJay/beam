@@ -11,6 +11,12 @@ use crate::error::TransferError;
 use crate::manifest::manifest_from_plaintext_file;
 use crate::manifest::ChunkHashCommitment;
 use crate::manifest::OneFileManifest;
+use crate::session_crypto::{
+    decode_manifest_plaintext, decrypt_chunk_payload, decrypt_control_payload,
+    decrypt_manifest_blob, encode_manifest_plaintext, encrypt_chunk_payload,
+    encrypt_control_payload, encrypt_manifest_blob, receiver_approve_payload, HandshakeBinding,
+    InviteContext, SessionSecrets,
+};
 
 /// What to do if the final path already exists when finalizing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +224,59 @@ pub fn transfer_one_file_local(
     for chunk_index in 0..provider.manifest().chunk_count {
         let data = provider.read_chunk(chunk_index)?;
         receiver.receive_chunk(chunk_index, &data)?;
+    }
+
+    receiver.finalize()
+}
+
+/// Phase 2 local path: same as [`transfer_one_file_local`], but manifest + control + chunk bytes use session crypto (compress is a no-op until wired).
+pub fn transfer_one_file_local_encrypted(
+    secrets: &SessionSecrets,
+    invite: InviteContext,
+    source: &Path,
+    staging: &Path,
+    destination: &Path,
+    relative_path: &str,
+    chunk_size: u64,
+    conflict: DestinationConflictPolicy,
+) -> Result<(), TransferError> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let binding = HandshakeBinding {
+        invite,
+        chunk_size,
+        framing_version: 1,
+    };
+    let keys = secrets.derive_keys(&binding)?;
+
+    let provider = LocalProvider::from_file(source.to_path_buf(), relative_path, chunk_size)?;
+    let sealed_manifest =
+        encrypt_manifest_blob(&keys, &encode_manifest_plaintext(provider.manifest()))?;
+
+    let opened_plain = decrypt_manifest_blob(&keys, &sealed_manifest)?;
+    let recv_manifest = decode_manifest_plaintext(&opened_plain)?;
+
+    let approve = encrypt_control_payload(
+        keys.control_key(),
+        keys.session_id(),
+        receiver_approve_payload(),
+    )?;
+    decrypt_control_payload(keys.control_key(), keys.session_id(), &approve)?;
+
+    let mut receiver = LocalReceiver::new(
+        recv_manifest,
+        staging.to_path_buf(),
+        destination.to_path_buf(),
+        conflict,
+    )?;
+
+    for chunk_index in 0..provider.manifest().chunk_count {
+        let pt = provider.read_chunk(chunk_index)?;
+        let wire = encrypt_chunk_payload(&keys, chunk_index, &pt)?;
+        let plaintext = decrypt_chunk_payload(&keys, chunk_index, &wire)?;
+        receiver.receive_chunk(chunk_index, &plaintext)?;
     }
 
     receiver.finalize()

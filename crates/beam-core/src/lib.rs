@@ -1,7 +1,6 @@
 //! Shared logic for Beam clients and relay.
 //!
-//! Wire protocols and cryptography are out of scope for early phases;
-//! local plaintext transfer scaffolding lives in [`local_transfer`] and [`manifest`].
+//! Local transfer scaffolding lives in [`local_transfer`] and [`manifest`]; Phase 2 adds [`session_crypto`] for application-layer envelopes.
 
 #![forbid(unsafe_code)]
 
@@ -9,6 +8,7 @@ pub mod chunking;
 mod error;
 pub mod local_transfer;
 pub mod manifest;
+pub mod session_crypto;
 
 pub use error::TransferError;
 pub use manifest::manifest_from_plaintext_file;

@@ -32,6 +32,14 @@ pub enum TransferError {
     },
     FileDigestMismatch,
     DestinationExists(PathBuf),
+    /// Symmetric crypto / key schedule failure (AEAD seal, HKDF, etc.).
+    SessionCrypto(&'static str),
+    /// Manifest or metadata envelope failed AEAD or used the wrong session material.
+    ManifestEnvelopeAuthFailed,
+    /// Chunk ciphertext failed AEAD or used the wrong purpose key.
+    ChunkEnvelopeAuthFailed,
+    /// Control-plane envelope failed AEAD or used the wrong purpose key.
+    ControlEnvelopeAuthFailed,
 }
 
 impl fmt::Display for TransferError {
@@ -77,6 +85,18 @@ impl fmt::Display for TransferError {
                     "destination exists and overwrite is not permitted: {}",
                     p.display()
                 )
+            }
+            TransferError::SessionCrypto(msg) => {
+                write!(f, "session crypto error: {msg}")
+            }
+            TransferError::ManifestEnvelopeAuthFailed => {
+                write!(f, "manifest envelope authentication failed")
+            }
+            TransferError::ChunkEnvelopeAuthFailed => {
+                write!(f, "chunk envelope authentication failed")
+            }
+            TransferError::ControlEnvelopeAuthFailed => {
+                write!(f, "control envelope authentication failed")
             }
         }
     }
