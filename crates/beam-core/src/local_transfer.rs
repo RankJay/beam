@@ -45,6 +45,29 @@ impl LocalProvider {
         Ok(Self { source, manifest })
     }
 
+    /// Use a frozen manifest from [`crate::folder_snapshot::build_folder_snapshot_manifest`]; rejects source size drift (ADR 0079).
+    pub fn with_frozen_file_manifest(
+        source: impl Into<PathBuf>,
+        manifest: OneFileManifest,
+    ) -> Result<Self, TransferError> {
+        let source = source.into();
+        let meta = fs::metadata(&source)?;
+        if !meta.is_file() {
+            return Err(TransferError::InvalidManifest(
+                "snapshot source is not a regular file",
+            ));
+        }
+        if meta.len() != manifest.size {
+            return Err(TransferError::SnapshotSourceSizeMismatch {
+                rel_path: manifest.relative_path.clone(),
+                expected: manifest.size,
+                actual: meta.len(),
+            });
+        }
+        manifest.validate()?;
+        Ok(Self { source, manifest })
+    }
+
     #[must_use]
     pub fn manifest(&self) -> &OneFileManifest {
         &self.manifest

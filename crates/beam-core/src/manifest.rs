@@ -14,14 +14,14 @@ use crate::error::TransferError;
 pub type Blake3Digest = [u8; 32];
 
 /// Chunk hash maturity: only [`ChunkHashCommitment::Committed`] is a content commitment for verification.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ChunkHashCommitment {
     Pending,
     Committed(Blake3Digest),
 }
 
 /// Describes a single file's transfer shape and commitments before/during plaintext transfer (ADR 0040).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OneFileManifest {
     /// Logical relative path used for naming at the receiver (posix-style or plain name for this slice).
     pub relative_path: String,

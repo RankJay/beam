@@ -8,6 +8,9 @@ use std::time::Duration;
 
 use beam_core::chunking::DEFAULT_CHUNK_SIZE;
 use beam_core::direct_quic::{framed_transfer_receiver_quic_leg_blocking, ReceiverSessionOutcome};
+use beam_core::folder_snapshot::{
+    build_folder_snapshot_manifest, transfer_folder_snapshot_local, SnapshotFilters,
+};
 use beam_core::local_transfer::{
     transfer_one_file_local, transfer_one_file_local_encrypted, DestinationConflictPolicy, LocalReceiver,
 };
@@ -72,6 +75,25 @@ enum Command {
         relative_path: Option<String>,
         #[arg(long)]
         encrypted: bool,
+    },
+    /// Copy a folder snapshot: full manifest before transfer, filters, staged per file (Phase 8).
+    LocalTransferFolder {
+        #[arg(value_name = "SOURCE_DIR")]
+        from: PathBuf,
+        /// Destination root directory (created; tree mirrors source).
+        #[arg(value_name = "DEST_DIR")]
+        to: PathBuf,
+        #[arg(long, value_name = "BYTES")]
+        chunk_size: Option<u64>,
+        #[arg(long, value_name = "DIR")]
+        staging_dir: Option<PathBuf>,
+        /// Label embedded in per-file manifest paths (receiver summary / approval).
+        #[arg(long, default_value = "snap")]
+        root_label: String,
+        #[arg(long = "exclude", value_name = "GLOB")]
+        excludes: Vec<String>,
+        #[arg(long = "include", value_name = "GLOB")]
+        includes: Vec<String>,
     },
     Version,
     /// Continue a paused receiver transfer using a structured session file (Phase 7).
@@ -231,6 +253,55 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::LocalTransferFolder {
+            from,
+            to,
+            chunk_size,
+            staging_dir,
+            root_label,
+            excludes,
+            includes,
+        } => {
+            let chunk_size = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
+            let filters = SnapshotFilters {
+                include_globs: includes,
+                exclude_globs: excludes,
+            };
+            let snap = build_folder_snapshot_manifest(&from, &root_label, filters, chunk_size)
+                .unwrap_or_else(|e| {
+                    eprintln!("beam local-transfer-folder: {e}");
+                    std::process::exit(1);
+                });
+            for line in snap.approval_summary_lines() {
+                eprintln!("{line}");
+            }
+            let staging = staging_dir.unwrap_or_else(|| {
+                to.parent()
+                    .map(|p| p.join(format!("{}.beam-folder-staging", to.file_name().and_then(|n| n.to_str()).unwrap_or("dest"))))
+                    .unwrap_or_else(|| PathBuf::from(".beam-folder-staging"))
+            });
+            let report = transfer_folder_snapshot_local(
+                &from,
+                &to,
+                &snap,
+                &staging,
+                DestinationConflictPolicy::FailIfExists,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("beam local-transfer-folder: {e}");
+                std::process::exit(1);
+            });
+            for (path, outcome) in &report.by_rel_path {
+                eprintln!("{path}: {outcome:?}");
+            }
+            if report
+                .by_rel_path
+                .values()
+                .any(|o| matches!(o, beam_core::folder_snapshot::FolderEntryOutcome::Failed(_)))
+            {
+                std::process::exit(1);
+            }
+        }
         Command::Resume { session, provider } => {
             let loaded = LocalSessionFileV1::load(&session).unwrap_or_else(|e| {
                 eprintln!("beam resume: {e}");
@@ -345,6 +416,37 @@ mod tests {
                 human_words: false,
                 timeout_secs: 600,
             } if url == "http://127.0.0.1:8787/"
+        ));
+    }
+
+    #[test]
+    fn cli_parses_local_transfer_folder() {
+        let cli = Cli::try_parse_from([
+            "beam",
+            "local-transfer-folder",
+            "C:\\src",
+            "C:\\dst\\out",
+            "--exclude",
+            "*.tmp",
+            "--include",
+            "*.rs",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::LocalTransferFolder {
+                ref from,
+                ref to,
+                chunk_size: None,
+                staging_dir: None,
+                ref root_label,
+                ref excludes,
+                ref includes,
+            } if from == Path::new("C:\\src")
+                && to == Path::new("C:\\dst\\out")
+                && root_label == "snap"
+                && excludes == &["*.tmp".to_string()]
+                && includes == &["*.rs".to_string()]
         ));
     }
 

@@ -1,12 +1,14 @@
 //! Shared logic for Beam clients and relay.
 //!
-//! Local transfer scaffolding lives in [`local_transfer`] and [`manifest`]; session crypto and pairing live in [`session_crypto`] and [`pairing`].
+//! Local transfer scaffolding lives in [`local_transfer`], [`manifest`], and [`folder_snapshot`];
+//! session crypto and pairing live in [`session_crypto`] and [`pairing`].
 
 #![forbid(unsafe_code)]
 
 pub mod chunking;
 pub mod direct_quic;
 mod error;
+pub mod folder_snapshot;
 pub mod local_transfer;
 pub mod manifest;
 pub mod pairing;

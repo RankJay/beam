@@ -52,6 +52,14 @@ pub enum TransferError {
     ResumeMachineMismatch,
     /// Resume arguments disagree with persisted session (filters, paths, etc.).
     ResumeRejected(&'static str),
+    /// Source file size no longer matches an approved per-file manifest (Phase 8, ADR 0079).
+    SnapshotSourceSizeMismatch {
+        rel_path: String,
+        expected: u64,
+        actual: u64,
+    },
+    /// Expected a directory for folder snapshot operations.
+    NotADirectory(PathBuf),
 }
 
 impl fmt::Display for TransferError {
@@ -130,6 +138,19 @@ impl fmt::Display for TransferError {
             }
             TransferError::ResumeRejected(msg) => {
                 write!(f, "resume rejected: {msg}")
+            }
+            TransferError::SnapshotSourceSizeMismatch {
+                rel_path,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "source changed since snapshot: {rel_path} expected size {expected}, actual {actual}"
+                )
+            }
+            TransferError::NotADirectory(p) => {
+                write!(f, "not a directory: {}", p.display())
             }
         }
     }
