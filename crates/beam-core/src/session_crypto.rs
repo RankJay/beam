@@ -22,6 +22,8 @@ const AAD_CONTROL_ENVELOPE: &[u8] = b"beam.v1.env.control.v1";
 const AAD_CHUNK_ENVELOPE: &[u8] = b"beam.v1.env.chunk.v1";
 
 const CONTROL_APPROVE_PAYLOAD: &[u8] = b"beam.v1.ctrl.receiver_approve_one_file.v1";
+const CONTROL_PAUSE_PAYLOAD: &[u8] = b"beam.v1.ctrl.pause.v1";
+const CONTROL_TRANSFER_DONE_PAYLOAD: &[u8] = b"beam.v1.ctrl.transfer_done.v1";
 
 /// Invite / rendezvous context bound into every derived key (`[0;32]` acceptable for temporary local pairing).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,8 +105,22 @@ impl SessionSecrets {
     }
 
     /// Purpose-separated keys bound to the handshake transcript and root IKM.
+    ///
+    /// `connection_serial` **0** uses the initial pairing transcript only. Each clean reconnect / resume
+    /// leg increments the serial so HKDF sees fresh salt material (ADR 0073) while the root [`ikm`]
+    /// stays tied to the persisted session secret.
     pub fn derive_keys(&self, binding: &HandshakeBinding) -> Result<SessionKeys, TransferError> {
-        let transcript = self.transcript_digest(binding);
+        self.derive_keys_for_connection_serial(binding, 0)
+    }
+
+    /// Derive AEAD keys for a given QUIC leg. Serial **0** matches legacy first connection;
+    /// serial **≥ 1** mixes a reconnect transcript into the HKDF salt.
+    pub fn derive_keys_for_connection_serial(
+        &self,
+        binding: &HandshakeBinding,
+        connection_serial: u64,
+    ) -> Result<SessionKeys, TransferError> {
+        let transcript = connection_serial_key_salt(&self.session_id, binding, connection_serial);
         let hk = Hkdf::<Sha256>::new(Some(&transcript), &self.ikm);
         let mut metadata_key = [0u8; 32];
         let mut control_key = [0u8; 32];
@@ -125,6 +141,18 @@ impl SessionSecrets {
             chunk_key,
             reconnect_key,
         })
+    }
+
+    /// Reconstruct secrets from persisted pairing output (Phase 7 local session files).
+    #[must_use]
+    pub fn from_persisted_parts(session_id: [u8; 16], ikm: [u8; 32]) -> Self {
+        Self { session_id, ikm }
+    }
+
+    /// Copy material for structured session persistence. Caller must protect stored bytes.
+    #[must_use]
+    pub fn persist_parts(&self) -> ([u8; 16], [u8; 32]) {
+        (self.session_id, self.ikm)
     }
 
     /// Shared secret gate for the blind relay data pipe (ADR 0034/0086); relay stores it, peers derive from session + room.
@@ -161,6 +189,23 @@ fn handshake_transcript_sha256(session_id: &[u8; 16], binding: &HandshakeBinding
     h.update(binding.invite.0);
     h.update(binding.chunk_size.to_le_bytes());
     h.update([binding.framing_version]);
+    h.finalize().into()
+}
+
+fn connection_serial_key_salt(
+    session_id: &[u8; 16],
+    binding: &HandshakeBinding,
+    connection_serial: u64,
+) -> [u8; 32] {
+    let base = handshake_transcript_sha256(session_id, binding);
+    if connection_serial == 0 {
+        return base;
+    }
+    let mut h = Sha256::new();
+    h.update(b"beam.v1.reconnect.transcript.v1");
+    h.update(session_id);
+    h.update(base);
+    h.update(connection_serial.to_le_bytes());
     h.finalize().into()
 }
 
@@ -454,6 +499,18 @@ pub fn receiver_approve_payload() -> &'static [u8] {
     CONTROL_APPROVE_PAYLOAD
 }
 
+/// Receiver→provider pause control body (authenticated under control key).
+#[must_use]
+pub fn pause_transfer_payload() -> &'static [u8] {
+    CONTROL_PAUSE_PAYLOAD
+}
+
+/// Receiver→provider clean end-of-transfer marker (authenticated under control key).
+#[must_use]
+pub fn transfer_done_payload() -> &'static [u8] {
+    CONTROL_TRANSFER_DONE_PAYLOAD
+}
+
 pub fn encrypt_chunk_payload(
     keys: &SessionKeys,
     index: u32,
@@ -475,4 +532,23 @@ pub fn decrypt_chunk_payload(
         blob,
         TransferError::ChunkEnvelopeAuthFailed,
     )
+}
+
+#[cfg(test)]
+mod connection_serial_tests {
+    use super::{HandshakeBinding, InviteContext, SessionSecrets};
+
+    #[test]
+    fn connection_serial_derives_distinct_chunk_keys() {
+        let secrets = SessionSecrets::pairing_shim_local();
+        let binding = HandshakeBinding {
+            invite: InviteContext::default(),
+            chunk_size: 64,
+            framing_version: 1,
+        };
+        let k0 = secrets.derive_keys_for_connection_serial(&binding, 0).unwrap();
+        let k1 = secrets.derive_keys_for_connection_serial(&binding, 1).unwrap();
+        assert_ne!(k0.chunk_key(), k1.chunk_key());
+        assert_ne!(k0.control_key(), k1.control_key());
+    }
 }

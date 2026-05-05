@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use beam_core::chunking::DEFAULT_CHUNK_SIZE;
+use beam_core::direct_quic::{framed_transfer_receiver_quic_leg_blocking, ReceiverSessionOutcome};
 use beam_core::local_transfer::{
-    transfer_one_file_local, transfer_one_file_local_encrypted, DestinationConflictPolicy,
+    transfer_one_file_local, transfer_one_file_local_encrypted, DestinationConflictPolicy, LocalReceiver,
 };
 use beam_core::pairing::{
     parse_invite_line, prepare_invite_human_words, prepare_invite_human_words_http,
@@ -16,6 +17,7 @@ use beam_core::pairing::{
     RelayTransport, RELAY_BEAM_FS_PREFIX,
 };
 use beam_core::session_crypto::{InviteContext, SessionSecrets};
+use beam_core::session_file::LocalSessionFileV1;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -72,6 +74,17 @@ enum Command {
         encrypted: bool,
     },
     Version,
+    /// Continue a paused receiver transfer using a structured session file (Phase 7).
+    ///
+    /// The provider must listen with matching session material and the correct connection leg
+    /// (same `next_connection_serial` as stored in the session file).
+    Resume {
+        #[arg(value_name = "SESSION_JSON")]
+        session: PathBuf,
+        /// Address of the running provider (`host:port`).
+        #[arg(long)]
+        provider: std::net::SocketAddr,
+    },
 }
 
 fn default_staging_path(dest: &Path) -> PathBuf {
@@ -218,6 +231,64 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Resume { session, provider } => {
+            let loaded = LocalSessionFileV1::load(&session).unwrap_or_else(|e| {
+                eprintln!("beam resume: {e}");
+                std::process::exit(1);
+            });
+            if let Err(e) = loaded.validate_machine() {
+                eprintln!("beam resume: {e}");
+                std::process::exit(1);
+            }
+            let secrets = loaded.session_secrets().unwrap_or_else(|e| {
+                eprintln!("beam resume: {e}");
+                std::process::exit(1);
+            });
+            let binding = loaded.handshake_binding().unwrap_or_else(|e| {
+                eprintln!("beam resume: {e}");
+                std::process::exit(1);
+            });
+            let manifest = loaded.manifest_from_session().unwrap_or_else(|e| {
+                eprintln!("beam resume: {e}");
+                std::process::exit(1);
+            });
+            let receiver = LocalReceiver::resume(
+                manifest,
+                loaded.staging_path_buf(),
+                loaded.destination_path_buf(),
+                loaded.conflict_policy(),
+                loaded.chunk_received.clone(),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("beam resume: {e}");
+                std::process::exit(1);
+            });
+            let flags = receiver.chunk_received_flags();
+            let missing: Vec<u32> = (0..flags.len())
+                .filter(|&i| !flags[i])
+                .map(|i| i as u32)
+                .collect();
+            let outcome = framed_transfer_receiver_quic_leg_blocking(
+                provider,
+                &secrets,
+                &binding,
+                loaded.next_connection_serial,
+                receiver,
+                &missing,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("beam resume: {e}");
+                std::process::exit(1);
+            });
+            match outcome {
+                ReceiverSessionOutcome::Completed => {
+                    eprintln!("beam resume: transfer completed.");
+                }
+                ReceiverSessionOutcome::Paused { .. } => {
+                    eprintln!("beam resume: paused again; update session file support is manual for now.");
+                }
+            }
+        }
         Command::Version => println!("{}", beam_core::build_identity()),
     }
 }
@@ -274,6 +345,26 @@ mod tests {
                 human_words: false,
                 timeout_secs: 600,
             } if url == "http://127.0.0.1:8787/"
+        ));
+    }
+
+    #[test]
+    fn cli_parses_resume() {
+        let cli = Cli::try_parse_from([
+            "beam",
+            "resume",
+            "C:\\beam\\sess.json",
+            "--provider",
+            "127.0.0.1:4433",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Resume {
+                ref session,
+                provider,
+            } if session == Path::new("C:\\beam\\sess.json")
+                && provider == std::net::SocketAddr::from(([127, 0, 0, 1], 4433))
         ));
     }
 

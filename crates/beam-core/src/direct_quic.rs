@@ -19,11 +19,12 @@ use tokio::sync::oneshot;
 
 use crate::error::TransferError;
 use crate::local_transfer::{DestinationConflictPolicy, LocalProvider, LocalReceiver};
+use crate::manifest::OneFileManifest;
 use crate::session_crypto::{
     decode_manifest_plaintext, decrypt_chunk_payload, decrypt_control_payload,
     decrypt_manifest_blob, encode_manifest_plaintext, encrypt_chunk_payload,
-    encrypt_control_payload, encrypt_manifest_blob, receiver_approve_payload, HandshakeBinding,
-    InviteContext, SessionKeys, SessionSecrets,
+    encrypt_control_payload, encrypt_manifest_blob, pause_transfer_payload, receiver_approve_payload,
+    transfer_done_payload, HandshakeBinding, InviteContext, SessionKeys, SessionSecrets,
 };
 
 /// Wire magic for application-layer QUIC frames (`BMQ1`).
@@ -32,6 +33,8 @@ pub const QUIC_FRAME_MAGIC: [u8; 4] = *b"BMQ1";
 const CONTROL_REQ_MANIFEST: u8 = 1;
 const CONTROL_MANIFEST_BODY: u8 = 2;
 const CONTROL_RECEIVER_APPROVE: u8 = 3;
+const CONTROL_PAUSE: u8 = 4;
+const CONTROL_TRANSFER_DONE: u8 = 5;
 const CHUNK_REQ: u8 = 0x20;
 const CHUNK_RESP: u8 = 0x21;
 
@@ -270,6 +273,13 @@ pub fn loopback_connect_addr(advertised: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Receiver finished all chunks and finalized; or paused with [`LocalReceiver`] for persistence.
+#[derive(Debug)]
+pub enum ReceiverSessionOutcome {
+    Completed,
+    Paused { receiver: LocalReceiver },
+}
+
 async fn provider_framed_session(
     send: &mut SendStream,
     recv: &mut RecvStream,
@@ -293,34 +303,50 @@ async fn provider_framed_session(
     decrypt_control_payload(keys.control_key(), keys.session_id(), &approve_blob)
         .map_err(|_| TransferError::ControlEnvelopeAuthFailed)?;
 
-    for chunk_idx in 0..provider.manifest().chunk_count {
-        let (ck, req) = read_framed(recv, 64).await?;
-        if ck != CHUNK_REQ || req.len() != 4 {
-            return Err(TransferError::WireProtocol("chunk request malformed"));
+    loop {
+        let (ck, req) = read_framed(recv, MAX_CONTROL_PAYLOAD).await?;
+        match ck {
+            CHUNK_REQ => {
+                if req.len() != 4 {
+                    return Err(TransferError::WireProtocol("chunk request malformed"));
+                }
+                let requested = u32::from_le_bytes(req.try_into().unwrap());
+                if requested >= provider.manifest().chunk_count {
+                    return Err(TransferError::WireProtocol("chunk request out of range"));
+                }
+                let pt = provider.read_chunk(requested)?;
+                let sealed = encrypt_chunk_payload(keys, requested, &pt)?;
+                write_frame(send, CHUNK_RESP, &sealed).await?;
+            }
+            CONTROL_PAUSE => {
+                let plain = decrypt_control_payload(keys.control_key(), keys.session_id(), &req)
+                    .map_err(|_| TransferError::ControlEnvelopeAuthFailed)?;
+                if plain.as_slice() != pause_transfer_payload() {
+                    return Err(TransferError::WireProtocol("unexpected pause payload"));
+                }
+                return Ok(());
+            }
+            CONTROL_TRANSFER_DONE => {
+                let plain = decrypt_control_payload(keys.control_key(), keys.session_id(), &req)
+                    .map_err(|_| TransferError::ControlEnvelopeAuthFailed)?;
+                if plain.as_slice() != transfer_done_payload() {
+                    return Err(TransferError::WireProtocol("unexpected transfer-done payload"));
+                }
+                return Ok(());
+            }
+            _ => {
+                return Err(TransferError::WireProtocol("unexpected frame during data transfer"));
+            }
         }
-        let requested = u32::from_le_bytes(req.try_into().unwrap());
-        if requested != chunk_idx {
-            return Err(TransferError::WireProtocol(
-                "chunk requests arrived out of expected order",
-            ));
-        }
-
-        let pt = provider.read_chunk(chunk_idx)?;
-        let sealed = encrypt_chunk_payload(keys, chunk_idx, &pt)?;
-        write_frame(send, CHUNK_RESP, &sealed).await?;
     }
-
-    Ok(())
 }
 
-async fn receiver_framed_session(
+async fn receiver_framed_exchange_manifest(
     send: &mut SendStream,
     recv: &mut RecvStream,
     keys: &SessionKeys,
-    staging: PathBuf,
-    destination: PathBuf,
-    conflict: DestinationConflictPolicy,
-) -> Result<(), TransferError> {
+    must_match: Option<&OneFileManifest>,
+) -> Result<OneFileManifest, TransferError> {
     write_frame(send, CONTROL_REQ_MANIFEST, &[]).await?;
     let (mk, sealed_manifest) = read_framed(recv, MAX_CONTROL_PAYLOAD).await?;
     if mk != CONTROL_MANIFEST_BODY {
@@ -329,7 +355,14 @@ async fn receiver_framed_session(
 
     let opened_plain = decrypt_manifest_blob(keys, &sealed_manifest)
         .map_err(|_| TransferError::ManifestEnvelopeAuthFailed)?;
-    let recv_manifest = decode_manifest_plaintext(&opened_plain)?;
+    let wire_manifest = decode_manifest_plaintext(&opened_plain)?;
+    if let Some(expected) = must_match {
+        if wire_manifest != *expected {
+            return Err(TransferError::ResumeRejected(
+                "manifest on wire does not match resumed session",
+            ));
+        }
+    }
 
     let approve_wire = encrypt_control_payload(
         keys.control_key(),
@@ -337,11 +370,17 @@ async fn receiver_framed_session(
         receiver_approve_payload(),
     )?;
     write_frame(send, CONTROL_RECEIVER_APPROVE, &approve_wire).await?;
+    Ok(wire_manifest)
+}
 
-    let mut receiver = LocalReceiver::new(recv_manifest, staging, destination, conflict)?;
-
-    let chunk_count = receiver.manifest().chunk_count;
-    for chunk_idx in 0..chunk_count {
+async fn receiver_framed_run_chunks(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    keys: &SessionKeys,
+    mut receiver: LocalReceiver,
+    chunks_to_request: &[u32],
+) -> Result<ReceiverSessionOutcome, TransferError> {
+    for &chunk_idx in chunks_to_request {
         write_frame(send, CHUNK_REQ, &chunk_idx.to_le_bytes()).await?;
         let (rk, wired) = read_framed(recv, MAX_CHUNK_WIRE_PAYLOAD).await?;
         if rk != CHUNK_RESP {
@@ -352,8 +391,55 @@ async fn receiver_framed_session(
         receiver.receive_chunk(chunk_idx, &plain)?;
     }
 
-    receiver.finalize()?;
-    Ok(())
+    if receiver.all_chunks_received() {
+        let done_wire = encrypt_control_payload(
+            keys.control_key(),
+            keys.session_id(),
+            transfer_done_payload(),
+        )?;
+        write_frame(send, CONTROL_TRANSFER_DONE, &done_wire).await?;
+        receiver.finalize()?;
+        Ok(ReceiverSessionOutcome::Completed)
+    } else {
+        let pause_wire = encrypt_control_payload(
+            keys.control_key(),
+            keys.session_id(),
+            pause_transfer_payload(),
+        )?;
+        write_frame(send, CONTROL_PAUSE, &pause_wire).await?;
+        Ok(ReceiverSessionOutcome::Paused { receiver })
+    }
+}
+
+async fn receiver_framed_session(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    keys: &SessionKeys,
+    receiver: LocalReceiver,
+    chunks_to_request: &[u32],
+) -> Result<ReceiverSessionOutcome, TransferError> {
+    receiver_framed_exchange_manifest(send, recv, keys, Some(receiver.manifest())).await?;
+    receiver_framed_run_chunks(send, recv, keys, receiver, chunks_to_request).await
+}
+
+async fn receiver_framed_session_simple(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    keys: &SessionKeys,
+    staging: PathBuf,
+    destination: PathBuf,
+    conflict: DestinationConflictPolicy,
+) -> Result<(), TransferError> {
+    let recv_manifest = receiver_framed_exchange_manifest(send, recv, keys, None).await?;
+    let receiver = LocalReceiver::new(recv_manifest, staging, destination, conflict)?;
+    let chunk_count = receiver.manifest().chunk_count;
+    let all: Vec<u32> = (0..chunk_count).collect();
+    match receiver_framed_run_chunks(send, recv, keys, receiver, &all).await? {
+        ReceiverSessionOutcome::Completed => Ok(()),
+        ReceiverSessionOutcome::Paused { .. } => Err(TransferError::WireProtocol(
+            "unexpected pause on full chunk list",
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -366,8 +452,9 @@ async fn run_direct_quic_provider(
     relative_path: String,
     ready_tx: oneshot::Sender<SocketAddr>,
     log: Arc<std::sync::Mutex<Vec<DirectQuicEvent>>>,
+    connection_serial: u64,
 ) -> Result<(), TransferError> {
-    let keys = secrets.derive_keys(&binding)?;
+    let keys = secrets.derive_keys_for_connection_serial(&binding, connection_serial)?;
 
     install_ring_crypto_provider()?;
     let endpoint = Endpoint::server(server_cfg, listen)
@@ -420,15 +507,16 @@ async fn receiver_session(
     staging: &Path,
     destination: &Path,
     conflict: DestinationConflictPolicy,
+    connection_serial: u64,
 ) -> Result<(), TransferError> {
-    let keys = secrets.derive_keys(binding)?;
+    let keys = secrets.derive_keys_for_connection_serial(binding, connection_serial)?;
 
     let (mut send, mut recv) = connection
         .open_bi()
         .await
         .map_err(|_| TransferError::DirectQuicTransport(" open session stream failed"))?;
 
-    receiver_framed_session(
+    receiver_framed_session_simple(
         &mut send,
         &mut recv,
         &keys,
@@ -507,6 +595,7 @@ pub async fn transfer_one_file_direct_quic(
             rel,
             ready_tx,
             log,
+            0,
         )
         .await
     });
@@ -555,6 +644,7 @@ pub async fn transfer_one_file_direct_quic(
         staging,
         destination,
         conflict,
+        0,
     )
     .await?;
 
@@ -706,31 +796,49 @@ fn relay_provider_blocking(
     decrypt_control_payload(keys.control_key(), keys.session_id(), &approve_blob)
         .map_err(|_| TransferError::ControlEnvelopeAuthFailed)?;
 
-    for chunk_idx in 0..provider.manifest().chunk_count {
+    loop {
         let raw = relay_get_frame_loop(&agent, &url_up, &gate_hex, cfg.expires_unix)?;
-        let (ck, req) = decode_wire_frame(&raw, 64)?;
-        if ck != CHUNK_REQ || req.len() != 4 {
-            return Err(TransferError::WireProtocol("chunk request malformed"));
+        let (ck, req) = decode_wire_frame(&raw, MAX_CONTROL_PAYLOAD)?;
+        match ck {
+            CHUNK_REQ => {
+                if req.len() != 4 {
+                    return Err(TransferError::WireProtocol("chunk request malformed"));
+                }
+                let requested = u32::from_le_bytes(req.try_into().unwrap());
+                if requested >= provider.manifest().chunk_count {
+                    return Err(TransferError::WireProtocol("chunk request out of range"));
+                }
+                let pt = provider.read_chunk(requested)?;
+                let sealed = encrypt_chunk_payload(keys, requested, &pt)?;
+                relay_put_frame(
+                    &agent,
+                    &url_down,
+                    &gate_hex,
+                    cfg.expires_unix,
+                    &encode_wire_frame(CHUNK_RESP, &sealed)?,
+                )?;
+            }
+            CONTROL_PAUSE => {
+                let plain = decrypt_control_payload(keys.control_key(), keys.session_id(), &req)
+                    .map_err(|_| TransferError::ControlEnvelopeAuthFailed)?;
+                if plain.as_slice() != pause_transfer_payload() {
+                    return Err(TransferError::WireProtocol("unexpected pause payload"));
+                }
+                return Ok(());
+            }
+            CONTROL_TRANSFER_DONE => {
+                let plain = decrypt_control_payload(keys.control_key(), keys.session_id(), &req)
+                    .map_err(|_| TransferError::ControlEnvelopeAuthFailed)?;
+                if plain.as_slice() != transfer_done_payload() {
+                    return Err(TransferError::WireProtocol("unexpected transfer-done payload"));
+                }
+                return Ok(());
+            }
+            _ => {
+                return Err(TransferError::WireProtocol("unexpected frame during data transfer"));
+            }
         }
-        let requested = u32::from_le_bytes(req.try_into().unwrap());
-        if requested != chunk_idx {
-            return Err(TransferError::WireProtocol(
-                "chunk requests arrived out of expected order",
-            ));
-        }
-
-        let pt = provider.read_chunk(chunk_idx)?;
-        let sealed = encrypt_chunk_payload(keys, chunk_idx, &pt)?;
-        relay_put_frame(
-            &agent,
-            &url_down,
-            &gate_hex,
-            cfg.expires_unix,
-            &encode_wire_frame(CHUNK_RESP, &sealed)?,
-        )?;
     }
-
-    Ok(())
 }
 
 fn relay_receiver_blocking(
@@ -781,7 +889,8 @@ fn relay_receiver_blocking(
     let mut receiver = LocalReceiver::new(recv_manifest, staging, destination, conflict)?;
 
     let chunk_count = receiver.manifest().chunk_count;
-    for chunk_idx in 0..chunk_count {
+    let all: Vec<u32> = (0..chunk_count).collect();
+    for &chunk_idx in &all {
         relay_put_frame(
             &agent,
             &url_up,
@@ -799,6 +908,19 @@ fn relay_receiver_blocking(
             .map_err(|_| TransferError::ChunkEnvelopeAuthFailed)?;
         receiver.receive_chunk(chunk_idx, &plain)?;
     }
+
+    let done_wire = encrypt_control_payload(
+        keys.control_key(),
+        keys.session_id(),
+        transfer_done_payload(),
+    )?;
+    relay_put_frame(
+        &agent,
+        &url_up,
+        &gate_hex,
+        cfg.expires_unix,
+        &encode_wire_frame(CONTROL_TRANSFER_DONE, &done_wire)?,
+    )?;
 
     receiver.finalize()?;
     Ok(())
@@ -1011,7 +1133,7 @@ pub async fn transfer_one_file_with_relay_fallback(
                 .open_bi()
                 .await
                 .map_err(|_| TransferError::DirectQuicTransport(" open session stream failed"))?;
-            receiver_framed_session(
+            receiver_framed_session_simple(
                 &mut send,
                 &mut recv,
                 &keys,
@@ -1102,6 +1224,104 @@ pub async fn transfer_one_file_with_relay_fallback(
         peer: SocketAddrOwned::from_std(connect_target),
         direct_attempt_ms: direct_ms,
         relay_phase_ms: relay_ms,
+    })
+}
+
+/// One QUIC leg on the provider: bind, accept, framed manifest + chunk responses.
+#[allow(clippy::too_many_arguments)]
+pub async fn framed_transfer_provider_quic_leg(
+    server_cfg: quinn::ServerConfig,
+    listen: SocketAddr,
+    secrets: SessionSecrets,
+    binding: HandshakeBinding,
+    connection_serial: u64,
+    source: PathBuf,
+    relative_path: String,
+    ready_tx: oneshot::Sender<SocketAddr>,
+    log: Arc<std::sync::Mutex<Vec<DirectQuicEvent>>>,
+) -> Result<(), TransferError> {
+    run_direct_quic_provider(
+        server_cfg,
+        listen,
+        secrets,
+        binding,
+        source,
+        relative_path,
+        ready_tx,
+        log,
+        connection_serial,
+    )
+    .await
+}
+
+/// Receiver opens one QUIC connection to `connect_to` and runs [`receiver_framed_session`].
+#[allow(clippy::too_many_arguments)]
+pub async fn framed_transfer_receiver_quic_leg(
+    client_cfg: &quinn::ClientConfig,
+    connect_to: SocketAddr,
+    secrets: &SessionSecrets,
+    binding: &HandshakeBinding,
+    connection_serial: u64,
+    receiver: LocalReceiver,
+    chunks_to_request: &[u32],
+) -> Result<ReceiverSessionOutcome, TransferError> {
+    install_ring_crypto_provider()?;
+    let keys = secrets.derive_keys_for_connection_serial(binding, connection_serial)?;
+    let mut client_ep = Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+        .map_err(|_| TransferError::DirectQuicTransport(" QUIC client endpoint bind failed"))?;
+    client_ep.set_default_client_config(client_cfg.clone());
+
+    let connecting: Connecting = client_ep
+        .connect(connect_to, "localhost")
+        .map_err(|_| TransferError::DirectQuicTransport(" QUIC connect initiation failed"))?;
+    let connection = connecting
+        .await
+        .map_err(|_| TransferError::DirectQuicTransport(" QUIC connect handshake failed"))?;
+
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|_| TransferError::DirectQuicTransport(" open session stream failed"))?;
+
+    let out = receiver_framed_session(
+        &mut send,
+        &mut recv,
+        &keys,
+        receiver,
+        chunks_to_request,
+    )
+    .await?;
+
+    let _ = send.finish();
+    let _ = recv.read_to_end(usize::MAX).await;
+    client_ep.wait_idle().await;
+    Ok(out)
+}
+
+/// Blocking helper for CLI one-shot resume.
+#[allow(clippy::too_many_arguments)]
+pub fn framed_transfer_receiver_quic_leg_blocking(
+    connect_to: SocketAddr,
+    secrets: &SessionSecrets,
+    binding: &HandshakeBinding,
+    connection_serial: u64,
+    receiver: LocalReceiver,
+    chunks_to_request: &[u32],
+) -> Result<ReceiverSessionOutcome, TransferError> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|_| TransferError::DirectQuicTransport("tokio runtime init failed"))?;
+    rt.block_on(async {
+        let (_server_cfg, client_cfg) = development_localhost_quinn()?;
+        framed_transfer_receiver_quic_leg(
+            &client_cfg,
+            connect_to,
+            secrets,
+            binding,
+            connection_serial,
+            receiver,
+            chunks_to_request,
+        )
+        .await
     })
 }
 

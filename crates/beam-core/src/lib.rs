@@ -11,6 +11,7 @@ pub mod local_transfer;
 pub mod manifest;
 pub mod pairing;
 pub mod session_crypto;
+pub mod session_file;
 
 pub use error::TransferError;
 pub use manifest::manifest_from_plaintext_file;

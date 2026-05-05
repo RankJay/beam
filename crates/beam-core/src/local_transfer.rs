@@ -19,7 +19,8 @@ use crate::session_crypto::{
 };
 
 /// What to do if the final path already exists when finalizing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DestinationConflictPolicy {
     /// Refuse finalize when [`Path::exists`] would prevent a safe overwrite.
     FailIfExists,
@@ -56,6 +57,7 @@ impl LocalProvider {
 }
 
 /// Receiver side: write plaintext chunks to staging and finalize atomically onto the destination.
+#[derive(Debug)]
 pub struct LocalReceiver {
     manifest: OneFileManifest,
     staging_path: PathBuf,
@@ -100,6 +102,55 @@ impl LocalReceiver {
         })
     }
 
+    /// Continue assembly on existing staged bytes (no truncate). Caller supplies chunk completion flags from persisted session state.
+    pub fn resume(
+        manifest: OneFileManifest,
+        staging_path: PathBuf,
+        destination: PathBuf,
+        conflict: DestinationConflictPolicy,
+        chunk_received: Vec<bool>,
+    ) -> Result<Self, TransferError> {
+        manifest.validate()?;
+        if chunk_received.len() != manifest.chunk_count as usize {
+            return Err(TransferError::ResumeRejected(
+                "chunk_received length does not match manifest chunk_count",
+            ));
+        }
+
+        let staging_parent = staging_path.parent().ok_or(TransferError::InvalidManifest(
+            "staging path must have a parent directory",
+        ))?;
+        fs::create_dir_all(staging_parent)?;
+
+        let meta = fs::metadata(&staging_path)?;
+        if meta.len() != manifest.size {
+            return Err(TransferError::ResumeRejected(
+                "staging file size does not match manifest",
+            ));
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(false)
+            .truncate(false)
+            .open(&staging_path)?;
+
+        Ok(Self {
+            chunk_received,
+            manifest,
+            staging_path,
+            destination,
+            conflict,
+            file,
+        })
+    }
+
+    #[must_use]
+    pub fn chunk_received_flags(&self) -> &[bool] {
+        &self.chunk_received
+    }
+
     #[must_use]
     pub fn manifest(&self) -> &OneFileManifest {
         &self.manifest
@@ -115,6 +166,11 @@ impl LocalReceiver {
     #[must_use]
     pub fn destination(&self) -> &Path {
         &self.destination
+    }
+
+    #[must_use]
+    pub fn all_chunks_received(&self) -> bool {
+        self.chunk_received.iter().all(|b| *b)
     }
 
     /// Verify a plaintext chunk against its committed Blake3 digest and write it at the staged offset (ADR 0077, 0082).

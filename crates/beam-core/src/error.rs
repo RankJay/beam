@@ -46,6 +46,12 @@ pub enum TransferError {
     DirectQuicTransport(&'static str),
     /// Blind relay byte pipe HTTP transport (ADR 0034).
     RelayPipe(&'static str),
+    /// Local session file missing, unreadable, or not valid JSON (Phase 7).
+    SessionState(&'static str),
+    /// Persisted session was created on another machine (ADR 0059).
+    ResumeMachineMismatch,
+    /// Resume arguments disagree with persisted session (filters, paths, etc.).
+    ResumeRejected(&'static str),
 }
 
 impl fmt::Display for TransferError {
@@ -112,6 +118,18 @@ impl fmt::Display for TransferError {
             }
             TransferError::RelayPipe(msg) => {
                 write!(f, "relay pipe error: {msg}")
+            }
+            TransferError::SessionState(msg) => {
+                write!(f, "session state: {msg}")
+            }
+            TransferError::ResumeMachineMismatch => {
+                write!(
+                    f,
+                    "resume rejected: session was created on a different machine"
+                )
+            }
+            TransferError::ResumeRejected(msg) => {
+                write!(f, "resume rejected: {msg}")
             }
         }
     }
