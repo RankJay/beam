@@ -1,6 +1,6 @@
 //! Shared logic for Beam clients and relay.
 //!
-//! Local transfer scaffolding lives in [`local_transfer`] and [`manifest`]; Phase 2 adds [`session_crypto`] for application-layer envelopes.
+//! Local transfer scaffolding lives in [`local_transfer`] and [`manifest`]; session crypto and pairing live in [`session_crypto`] and [`pairing`].
 
 #![forbid(unsafe_code)]
 
@@ -8,6 +8,7 @@ pub mod chunking;
 mod error;
 pub mod local_transfer;
 pub mod manifest;
+pub mod pairing;
 pub mod session_crypto;
 
 pub use error::TransferError;

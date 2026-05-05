@@ -1,4 +1,6 @@
-//! Application-layer session material, transcript-bound HKDF derivation, and XChaCha20-Poly1305 envelopes for local transfer (Phase 2 scaffolding; PAKE replaces `SessionSecrets::pairing_shim_local` later).
+//! Application-layer session material, transcript-bound HKDF derivation, and XChaCha20-Poly1305 envelopes for local transfer.
+//!
+//! Pairing establishes [`SessionSecrets`] via SPAKE2 (see [`crate::pairing`]); [`SessionSecrets::pairing_shim_local`] remains for offline tests without an invite.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
@@ -61,6 +63,28 @@ impl Drop for SessionSecrets {
 }
 
 impl SessionSecrets {
+    /// Builds session root material from a 32-byte SPAKE2 shared secret and the pairing room id (salt).
+    ///
+    /// Resume contexts must not depend on the human-facing invite code after pairing; they hang off these secrets.
+    pub fn from_pake_shared_secret(
+        pake_shared_key: &[u8],
+        room_id: &[u8; 16],
+    ) -> Result<Self, TransferError> {
+        if pake_shared_key.len() != 32 {
+            return Err(TransferError::SessionCrypto(
+                "PAKE shared secret must be 32 bytes",
+            ));
+        }
+        let hk = Hkdf::<Sha256>::new(Some(room_id), pake_shared_key);
+        let mut session_id = [0u8; 16];
+        let mut ikm = [0u8; 32];
+        hk.expand(b"beam.session.id.v1", &mut session_id)
+            .map_err(|_| TransferError::SessionCrypto("hkdf expand session id"))?;
+        hk.expand(b"beam.session.ikm.v1", &mut ikm)
+            .map_err(|_| TransferError::SessionCrypto("hkdf expand session ikm"))?;
+        Ok(Self { session_id, ikm })
+    }
+
     /// Temporary shim: emits fresh authenticated session secret material for same-process tests and local tooling.
     pub fn pairing_shim_local() -> Self {
         let mut session_id = [0u8; 16];
@@ -102,6 +126,21 @@ impl SessionSecrets {
             reconnect_key,
         })
     }
+}
+
+/// Canonical invite/rendezvous fingerprint bound into HKDF (distinct from the PAKE password material).
+#[must_use]
+pub fn invite_context_from_pairing(
+    room_id: &[u8; 16],
+    expires_unix: u64,
+    relay_tag: &[u8],
+) -> InviteContext {
+    let mut h = Sha256::new();
+    h.update(b"beam.invite.ctx.v1");
+    h.update(room_id);
+    h.update(expires_unix.to_le_bytes());
+    h.update(relay_tag);
+    InviteContext(h.finalize().into())
 }
 
 fn handshake_transcript_sha256(session_id: &[u8; 16], binding: &HandshakeBinding) -> [u8; 32] {
@@ -248,7 +287,8 @@ fn xchacha_open_into(
 #[must_use]
 pub fn encode_manifest_plaintext(m: &OneFileManifest) -> Vec<u8> {
     let path_bytes = m.relative_path.as_bytes();
-    let mut out = Vec::with_capacity(path_bytes.len() + 128 + usize::try_from(m.chunk_count).unwrap() * 33);
+    let mut out =
+        Vec::with_capacity(path_bytes.len() + 128 + usize::try_from(m.chunk_count).unwrap() * 33);
     out.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(path_bytes);
     out.extend_from_slice(&m.size.to_le_bytes());
@@ -309,9 +349,11 @@ pub fn decode_manifest_plaintext(data: &[u8]) -> Result<OneFileManifest, Transfe
 
     let mut chunk_hashes = Vec::with_capacity(chunk_count as usize);
     for _ in 0..chunk_count {
-        let tag = *take(&mut cur, 1)?.first().ok_or(TransferError::InvalidManifest(
-            "missing chunk commitment tag",
-        ))?;
+        let tag = *take(&mut cur, 1)?
+            .first()
+            .ok_or(TransferError::InvalidManifest(
+                "missing chunk commitment tag",
+            ))?;
         match tag {
             0 => chunk_hashes.push(ChunkHashCommitment::Pending),
             1 => {
@@ -395,12 +437,7 @@ pub fn decrypt_control_payload(
     blob: &[u8],
 ) -> Result<Vec<u8>, TransferError> {
     let aad = build_control_aad(session_id);
-    xchacha_open_into(
-        key,
-        &aad,
-        blob,
-        TransferError::ControlEnvelopeAuthFailed,
-    )
+    xchacha_open_into(key, &aad, blob, TransferError::ControlEnvelopeAuthFailed)
 }
 
 #[must_use]

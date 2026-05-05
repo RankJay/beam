@@ -9,9 +9,10 @@ use beam_core::local_transfer::{
     transfer_one_file_local_encrypted, DestinationConflictPolicy, LocalProvider,
 };
 use beam_core::session_crypto::{
-    decrypt_chunk_payload, decrypt_control_payload, decrypt_manifest_blob, encode_manifest_plaintext,
-    encrypt_chunk_payload, encrypt_control_payload, encrypt_manifest_blob, receiver_approve_payload,
-    HandshakeBinding, InviteContext, SessionSecrets,
+    decrypt_chunk_payload, decrypt_control_payload, decrypt_manifest_blob,
+    encode_manifest_plaintext, encrypt_chunk_payload, encrypt_control_payload,
+    encrypt_manifest_blob, receiver_approve_payload, HandshakeBinding, InviteContext,
+    SessionSecrets,
 };
 use beam_core::TransferError;
 
@@ -64,8 +65,11 @@ fn mismatched_handshake_binding_rejects_manifest_open() {
         })
         .expect("keys seal");
     let provider = LocalProvider::from_file(&src, "hb.bin", 4096).expect("prov");
-    let sealed = encrypt_manifest_blob(&keys_encrypt, &encode_manifest_plaintext(provider.manifest()))
-        .expect("seal");
+    let sealed = encrypt_manifest_blob(
+        &keys_encrypt,
+        &encode_manifest_plaintext(provider.manifest()),
+    )
+    .expect("seal");
 
     let keys_other_binding = secrets
         .derive_keys(&HandshakeBinding {
@@ -179,7 +183,8 @@ fn metadata_path_not_embedded_in_ciphertext_plaintext_leak_harness() {
     let keys = secrets.derive_keys(&binding_for(4096)).expect("keys");
     let provider =
         LocalProvider::from_file(&src, "deep/hidden/secret-name.bin", 4096).expect("prov");
-    let ct = encrypt_manifest_blob(&keys, &encode_manifest_plaintext(provider.manifest())).expect("ct");
+    let ct =
+        encrypt_manifest_blob(&keys, &encode_manifest_plaintext(provider.manifest())).expect("ct");
 
     let needle = b"deep/hidden/secret-name.bin";
     assert!(
@@ -199,8 +204,7 @@ fn crypto_overhead_smoke_stays_within_loose_budget() {
     let iterations = 48u32;
     let start = Instant::now();
     for i in 0..iterations {
-        let wire =
-            encrypt_chunk_payload(&keys, i, &plaintext).expect("seal chunk");
+        let wire = encrypt_chunk_payload(&keys, i, &plaintext).expect("seal chunk");
         let out = decrypt_chunk_payload(&keys, i, &wire).expect("open chunk");
         assert_eq!(out, plaintext);
     }
