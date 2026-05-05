@@ -354,9 +354,8 @@ pub fn prepare_invite_human_words_http(
     let room_b64 = URL_SAFE_NO_PAD.encode(room_id);
     let url_b64 = URL_SAFE_NO_PAD.encode(relay_url.as_bytes());
     let words = words_from_seed(&seed)?;
-    let line = format!(
-        "{INVITE_LINE_PREFIX}\tword\thttp\t{expires_unix}\t{room_b64}\t{url_b64}\t{words}"
-    );
+    let line =
+        format!("{INVITE_LINE_PREFIX}\tword\thttp\t{expires_unix}\t{room_b64}\t{url_b64}\t{words}");
     Ok(PreparedInvite {
         invite_line: line,
         room_id,
@@ -379,7 +378,8 @@ pub fn prepare_invite_long_token(
     rng.try_fill_bytes(&mut seed)
         .map_err(|_| PairingError::Crypto("rng seed"))?;
     let expires_unix = unix_now_secs().saturating_add(ttl_seconds);
-    let relay_url_stored = if relay_url.starts_with("http://") || relay_url.starts_with("https://") {
+    let relay_url_stored = if relay_url.starts_with("http://") || relay_url.starts_with("https://")
+    {
         normalize_http_relay_base(relay_url)
     } else {
         relay_url.to_owned()
@@ -887,7 +887,9 @@ pub struct HttpRelay {
 
 impl fmt::Debug for HttpRelay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HttpRelay").field("base", &self.base).finish()
+        f.debug_struct("HttpRelay")
+            .field("base", &self.base)
+            .finish()
     }
 }
 
@@ -905,19 +907,11 @@ impl HttpRelay {
     }
 
     fn url_sender(&self, room_id: &[u8; 16]) -> String {
-        format!(
-            "{}/v1/rooms/{}/sender",
-            self.base,
-            room_id_hex(room_id)
-        )
+        format!("{}/v1/rooms/{}/sender", self.base, room_id_hex(room_id))
     }
 
     fn url_receiver(&self, room_id: &[u8; 16]) -> String {
-        format!(
-            "{}/v1/rooms/{}/receiver",
-            self.base,
-            room_id_hex(room_id)
-        )
+        format!("{}/v1/rooms/{}/receiver", self.base, room_id_hex(room_id))
     }
 
     fn url_room(&self, room_id: &[u8; 16]) -> String {
@@ -1038,7 +1032,8 @@ impl RelayTransport {
             RendezvousRelay::BeamFs(path) => Ok(Self::Fs(FsRelay::new(path))),
             RendezvousRelay::Http(url) => Ok(Self::Http(HttpRelay::new(url))),
             RendezvousRelay::Default => Err(
-                "invite relay kind \"default\" cannot drive sender_prepare transport selection".into(),
+                "invite relay kind \"default\" cannot drive sender_prepare transport selection"
+                    .into(),
             ),
             RendezvousRelay::Unsupported(url) => Err(format!(
                 "relay URL {url:?} is not supported for pairing transport"
@@ -1048,7 +1043,10 @@ impl RelayTransport {
 
     /// Opens the transport implied by a parsed invite (`recv` side).
     #[must_use]
-    pub fn for_receiver(invite: &ParsedInvite, relay_dir_override: Option<PathBuf>) -> Result<Self, String> {
+    pub fn for_receiver(
+        invite: &ParsedInvite,
+        relay_dir_override: Option<PathBuf>,
+    ) -> Result<Self, String> {
         match (&invite.relay, relay_dir_override) {
             (RendezvousRelay::BeamFs(path), _) => Ok(Self::Fs(FsRelay::new(path))),
             (RendezvousRelay::Http(url), _) => Ok(Self::Http(HttpRelay::new(url))),
@@ -1214,8 +1212,7 @@ mod tests {
 
     #[test]
     fn token_invite_accepts_whitespace_field_separators() {
-        let prepared =
-            prepare_invite_long_token(120, "http://127.0.0.1:9/").expect("prep");
+        let prepared = prepare_invite_long_token(120, "http://127.0.0.1:9/").expect("prep");
         let tab_line = prepared.invite_line.clone();
         let parsed_tab = parse_invite_line(&tab_line).expect("tab parse");
         let spaced = tab_line.replace('\t', "   ");

@@ -263,13 +263,8 @@ mod tests {
 
     #[test]
     fn cli_parses_send_with_relay_url() {
-        let cli = Cli::try_parse_from([
-            "beam",
-            "send",
-            "--relay-url",
-            "http://127.0.0.1:8787/",
-        ])
-        .expect("parse");
+        let cli = Cli::try_parse_from(["beam", "send", "--relay-url", "http://127.0.0.1:8787/"])
+            .expect("parse");
         assert!(matches!(
             cli.command,
             Command::Send {

@@ -44,6 +44,8 @@ pub enum TransferError {
     WireProtocol(&'static str),
     /// Direct QUIC bootstrap or transport-layer failure distinct from TLS at app layer (ADR 0006).
     DirectQuicTransport(&'static str),
+    /// Blind relay byte pipe HTTP transport (ADR 0034).
+    RelayPipe(&'static str),
 }
 
 impl fmt::Display for TransferError {
@@ -107,6 +109,9 @@ impl fmt::Display for TransferError {
             }
             TransferError::DirectQuicTransport(msg) => {
                 write!(f, "direct QUIC transport error: {msg}")
+            }
+            TransferError::RelayPipe(msg) => {
+                write!(f, "relay pipe error: {msg}")
             }
         }
     }

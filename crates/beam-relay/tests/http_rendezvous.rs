@@ -46,7 +46,10 @@ fn http_relay_pairs_sender_and_receiver() {
     });
 
     let tx_sec = sender.join().expect("join sender").expect("sender pairs");
-    let rx_sec = receiver.join().expect("join receiver").expect("receiver pairs");
+    let rx_sec = receiver
+        .join()
+        .expect("join receiver")
+        .expect("receiver pairs");
 
     assert_eq!(tx_sec.session_id, rx_sec.session_id);
 }

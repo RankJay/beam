@@ -4,13 +4,15 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-description = "Beam HTTP rendezvous relay for pairing (single-use rooms, TTL)."
+description = "Beam HTTP relay: rendezvous pairing and blind encrypted data pipe (Phase 4/6)."
 
 [lints]
 workspace = true
 
 [dependencies]
 axum = "0.8.8"
-beam-core = { path = "../beam-core" }
 clap = { version = "4.5.61", features = ["derive"] }
 tokio = { version = "1.52.2", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+beam-core = { path = "../beam-core" }

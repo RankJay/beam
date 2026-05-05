@@ -17,12 +17,10 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let listener = TcpListener::bind(&args.listen)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("beam-relay: bind {} failed: {e}", args.listen);
-            std::process::exit(1);
-        });
+    let listener = TcpListener::bind(&args.listen).await.unwrap_or_else(|e| {
+        eprintln!("beam-relay: bind {} failed: {e}", args.listen);
+        std::process::exit(1);
+    });
     eprintln!("beam-relay: listening on {}", args.listen);
     let state = AppState::default();
     let app = router(state);

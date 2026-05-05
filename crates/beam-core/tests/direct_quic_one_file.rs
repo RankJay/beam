@@ -46,9 +46,14 @@ fn encrypted_one_file_transfer_over_direct_quic_localhost() {
     .expect("direct quic transfer");
 
     assert_eq!(receipt.path, TransferPathSurface::Direct);
+    assert_eq!(receipt.relay_phase_ms, None);
+    assert!(receipt.direct_attempt_ms.is_some());
     assert_eq!(fs::read(&dest).expect("read dest"), body);
     assert!(
-        receipt.events.iter().any(|e| matches!(e, DirectQuicEvent::ConnectOk { .. })),
+        receipt
+            .events
+            .iter()
+            .any(|e| matches!(e, DirectQuicEvent::ConnectOk { .. })),
         "expected ConnectOk in {:?}",
         receipt.events
     );
@@ -97,6 +102,8 @@ fn direct_quic_throughput_smoke_large_chunk() {
     let elapsed = t0.elapsed();
 
     assert_eq!(receipt.path, TransferPathSurface::Direct);
+    assert_eq!(receipt.relay_phase_ms, None);
+    assert!(receipt.direct_attempt_ms.is_some());
     assert_eq!(fs::metadata(&dest).expect("meta").len(), total);
     let mb = total as f64 / 1_000_000.0;
     let secs = elapsed.as_secs_f64().max(0.001);

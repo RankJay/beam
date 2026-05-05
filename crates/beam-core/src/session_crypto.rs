@@ -126,6 +126,15 @@ impl SessionSecrets {
             reconnect_key,
         })
     }
+
+    /// Shared secret gate for the blind relay data pipe (ADR 0034/0086); relay stores it, peers derive from session + room.
+    pub fn relay_pipe_gate_token(&self, room_id: &[u8; 16]) -> Result<[u8; 32], TransferError> {
+        let hk = Hkdf::<Sha256>::new(Some(room_id), &self.ikm);
+        let mut gate = [0u8; 32];
+        hk.expand(b"beam.relay.pipe_gate.v1", &mut gate)
+            .map_err(|_| TransferError::SessionCrypto("hkdf expand pipe gate"))?;
+        Ok(gate)
+    }
 }
 
 /// Canonical invite/rendezvous fingerprint bound into HKDF (distinct from the PAKE password material).
