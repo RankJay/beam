@@ -1,0 +1,50 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: beam-linux-x86_64
+            bin: beam
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: beam-windows-x86_64
+            bin: beam.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: beam-macos-aarch64
+            bin: beam
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: beam-macos-x86_64
+            bin: beam
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build beam-cli (release)
+        run: cargo build --release -p beam-cli --target ${{ matrix.target }} --locked
+
+      - name: Upload beam binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.bin }}

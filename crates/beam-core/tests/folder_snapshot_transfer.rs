@@ -45,14 +45,8 @@ fn nested_tree_empty_dir_and_files_round_trip() {
     )
     .expect("transfer");
 
-    assert_eq!(
-        std::fs::read(dest.join("a/x.txt")).expect("read"),
-        b"hello"
-    );
-    assert_eq!(
-        std::fs::read(dest.join("root.bin")).expect("read"),
-        b"z"
-    );
+    assert_eq!(std::fs::read(dest.join("a/x.txt")).expect("read"), b"hello");
+    assert_eq!(std::fs::read(dest.join("root.bin")).expect("read"), b"z");
     assert!(dest.join("a/empty").is_dir());
 }
 
@@ -140,13 +134,8 @@ fn symlink_is_skipped_and_not_restored() {
     std::fs::write(src.join("real.txt"), b"r").expect("write");
     symlink(src.join("real.txt"), src.join("link.txt")).expect("symlink");
 
-    let snap = build_folder_snapshot_manifest(
-        &src,
-        "b",
-        SnapshotFilters::default(),
-        256,
-    )
-    .expect("manifest");
+    let snap = build_folder_snapshot_manifest(&src, "b", SnapshotFilters::default(), 256)
+        .expect("manifest");
 
     assert_eq!(snap.entries.len(), 2, "file + symlink entries");
 
@@ -166,10 +155,7 @@ fn symlink_is_skipped_and_not_restored() {
         Some(&FolderEntryOutcome::SkippedDangerous)
     );
     assert!(!dest.join("link.txt").exists());
-    assert_eq!(
-        std::fs::read(dest.join("real.txt")).expect("read"),
-        b"r"
-    );
+    assert_eq!(std::fs::read(dest.join("real.txt")).expect("read"), b"r");
 }
 
 #[test]
@@ -180,8 +166,8 @@ fn one_corrupt_file_does_not_block_other_completion() {
     std::fs::write(src.join("good.bin"), vec![7_u8; 400]).expect("write");
     std::fs::write(src.join("bad.bin"), vec![9_u8; 400]).expect("write");
 
-    let snap =
-        build_folder_snapshot_manifest(&src, "b", SnapshotFilters::default(), 128).expect("manifest");
+    let snap = build_folder_snapshot_manifest(&src, "b", SnapshotFilters::default(), 128)
+        .expect("manifest");
 
     // Mutate bad.bin after snapshot — same size, different bytes; approved snapshot unchanged.
     let bad_path = src.join("bad.bin");
@@ -229,8 +215,8 @@ fn frozen_manifest_rejects_size_change_before_transfer() {
     std::fs::create_dir_all(&src).expect("mkdir");
     std::fs::write(src.join("only.txt"), b"abc").expect("write");
 
-    let snap =
-        build_folder_snapshot_manifest(&src, "b", SnapshotFilters::default(), 64).expect("manifest");
+    let snap = build_folder_snapshot_manifest(&src, "b", SnapshotFilters::default(), 64)
+        .expect("manifest");
     std::fs::write(src.join("only.txt"), b"abcd").expect("grow file");
 
     let dest = dir.path().join("out");
@@ -246,7 +232,10 @@ fn frozen_manifest_rejects_size_change_before_transfer() {
 
     match report.by_rel_path.get("only.txt") {
         Some(FolderEntryOutcome::Failed(msg)) => {
-            assert!(msg.contains("source changed") || msg.contains("size"), "{msg}");
+            assert!(
+                msg.contains("source changed") || msg.contains("size"),
+                "{msg}"
+            );
         }
         o => panic!("expected failure for size drift: {o:?}"),
     }

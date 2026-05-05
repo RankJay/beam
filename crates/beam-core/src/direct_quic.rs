@@ -19,13 +19,14 @@ use tokio::sync::oneshot;
 
 use crate::error::TransferError;
 use crate::local_transfer::{DestinationConflictPolicy, LocalProvider, LocalReceiver};
-use crate::retry::RetryPolicy;
 use crate::manifest::OneFileManifest;
+use crate::retry::RetryPolicy;
 use crate::session_crypto::{
     decode_manifest_plaintext, decrypt_chunk_payload, decrypt_control_payload,
     decrypt_manifest_blob, encode_manifest_plaintext, encrypt_chunk_payload,
-    encrypt_control_payload, encrypt_manifest_blob, pause_transfer_payload, receiver_approve_payload,
-    transfer_done_payload, HandshakeBinding, InviteContext, SessionKeys, SessionSecrets,
+    encrypt_control_payload, encrypt_manifest_blob, pause_transfer_payload,
+    receiver_approve_payload, transfer_done_payload, HandshakeBinding, InviteContext, SessionKeys,
+    SessionSecrets,
 };
 
 /// Wire magic for application-layer QUIC frames (`BMQ1`).
@@ -331,12 +332,16 @@ async fn provider_framed_session(
                 let plain = decrypt_control_payload(keys.control_key(), keys.session_id(), &req)
                     .map_err(|_| TransferError::ControlEnvelopeAuthFailed)?;
                 if plain.as_slice() != transfer_done_payload() {
-                    return Err(TransferError::WireProtocol("unexpected transfer-done payload"));
+                    return Err(TransferError::WireProtocol(
+                        "unexpected transfer-done payload",
+                    ));
                 }
                 return Ok(());
             }
             _ => {
-                return Err(TransferError::WireProtocol("unexpected frame during data transfer"));
+                return Err(TransferError::WireProtocol(
+                    "unexpected frame during data transfer",
+                ));
             }
         }
     }
@@ -835,12 +840,16 @@ fn relay_provider_blocking(
                 let plain = decrypt_control_payload(keys.control_key(), keys.session_id(), &req)
                     .map_err(|_| TransferError::ControlEnvelopeAuthFailed)?;
                 if plain.as_slice() != transfer_done_payload() {
-                    return Err(TransferError::WireProtocol("unexpected transfer-done payload"));
+                    return Err(TransferError::WireProtocol(
+                        "unexpected transfer-done payload",
+                    ));
                 }
                 return Ok(());
             }
             _ => {
-                return Err(TransferError::WireProtocol("unexpected frame during data transfer"));
+                return Err(TransferError::WireProtocol(
+                    "unexpected frame during data transfer",
+                ));
             }
         }
     }
@@ -1288,14 +1297,8 @@ pub async fn framed_transfer_receiver_quic_leg(
         .await
         .map_err(|_| TransferError::DirectQuicTransport(" open session stream failed"))?;
 
-    let out = receiver_framed_session(
-        &mut send,
-        &mut recv,
-        &keys,
-        receiver,
-        chunks_to_request,
-    )
-    .await?;
+    let out =
+        receiver_framed_session(&mut send, &mut recv, &keys, receiver, chunks_to_request).await?;
 
     let _ = send.finish();
     let _ = recv.read_to_end(usize::MAX).await;

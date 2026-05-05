@@ -132,10 +132,7 @@ impl fmt::Display for TransferError {
                 write!(f, "relay pipe error: {msg}")
             }
             TransferError::RelayHttpTransient { status } => {
-                write!(
-                    f,
-                    "relay HTTP {status} (transient; may retry under policy)"
-                )
+                write!(f, "relay HTTP {status} (transient; may retry under policy)")
             }
             TransferError::SessionState(msg) => {
                 write!(f, "session state: {msg}")

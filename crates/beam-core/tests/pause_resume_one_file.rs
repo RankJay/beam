@@ -6,13 +6,13 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use beam_core::direct_quic::{
-    development_localhost_quinn, framed_transfer_provider_quic_leg, framed_transfer_receiver_quic_leg,
-    ReceiverSessionOutcome,
+    development_localhost_quinn, framed_transfer_provider_quic_leg,
+    framed_transfer_receiver_quic_leg, ReceiverSessionOutcome,
 };
-use beam_core::TransferError;
 use beam_core::local_transfer::{DestinationConflictPolicy, LocalProvider, LocalReceiver};
 use beam_core::session_crypto::{HandshakeBinding, InviteContext, SessionSecrets};
 use beam_core::session_file::{assert_resume_relative_path, LocalSessionFileV1};
+use beam_core::TransferError;
 use tokio::sync::oneshot;
 
 #[tokio::test]
@@ -47,7 +47,7 @@ async fn pause_mid_transfer_resume_with_fresh_keys_same_machine() {
 
     let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
     let secrets_p0 = secrets.clone();
-    let binding_p0 = binding.clone();
+    let binding_p0 = binding;
     let src_clone = src_path.clone();
     let log0 = Arc::clone(&log);
     let prov0 = tokio::spawn(async move {
@@ -105,12 +105,15 @@ async fn pause_mid_transfer_resume_with_fresh_keys_same_machine() {
 
     prov0.await.expect("join prov0").expect("prov0 ok");
 
-    assert!(!dest_path.exists(), "destination must not exist until finalize");
+    assert!(
+        !dest_path.exists(),
+        "destination must not exist until finalize"
+    );
 
     let (server_cfg1, client_cfg1) = development_localhost_quinn().expect("quic dev creds");
     let (ready_tx1, ready_rx1) = oneshot::channel::<SocketAddr>();
     let secrets_p1 = secrets.clone();
-    let binding_p1 = binding.clone();
+    let binding_p1 = binding;
     let log1 = Arc::clone(&log);
     let prov1 = tokio::spawn(async move {
         framed_transfer_provider_quic_leg(
@@ -199,7 +202,7 @@ async fn resume_leg_fails_with_stale_connection_serial() {
         server_cfg,
         listen,
         secrets.clone(),
-        binding.clone(),
+        binding,
         1,
         src_path,
         "g.bin".into(),
@@ -226,7 +229,10 @@ async fn resume_leg_fails_with_stale_connection_serial() {
     .await
     .expect_err("serial mismatch");
     assert!(
-        matches!(err, TransferError::ManifestEnvelopeAuthFailed | TransferError::ChunkEnvelopeAuthFailed),
+        matches!(
+            err,
+            TransferError::ManifestEnvelopeAuthFailed | TransferError::ChunkEnvelopeAuthFailed
+        ),
         "wrong keys should fail open/decrypt, got {err:?}"
     );
     prov.abort();
@@ -234,8 +240,8 @@ async fn resume_leg_fails_with_stale_connection_serial() {
 
 #[test]
 fn deleted_session_file_cannot_resume() {
-    let err = LocalSessionFileV1::load("definitely-missing-beam-session.json")
-        .expect_err("missing file");
+    let err =
+        LocalSessionFileV1::load("definitely-missing-beam-session.json").expect_err("missing file");
     assert!(matches!(err, TransferError::SessionState(_)));
 }
 

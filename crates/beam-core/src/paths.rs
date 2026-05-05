@@ -12,9 +12,8 @@ pub fn beam_data_dir() -> PathBuf {
     }
     #[cfg(windows)]
     {
-        let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| {
-            std::env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string())
-        });
+        let base = std::env::var("LOCALAPPDATA")
+            .unwrap_or_else(|_| std::env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string()));
         PathBuf::from(base).join("Beam")
     }
     #[cfg(not(windows))]

@@ -69,7 +69,7 @@ impl From<std::io::Error> for PairingError {
 /// Rendezvous target encoded into an invite.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RendezvousRelay {
-    /// Hosted/default relay (URL negotiated out-of-band until cloud relay ships).
+    /// Hosted relay: resolves to [`crate::relay_default::resolved_public_relay_base_url`] on receive unless `--relay-dir` overrides with a filesystem mailbox.
     Default,
     /// Local mailbox directory used by [`FsRelay`].
     BeamFs(PathBuf),
@@ -289,7 +289,7 @@ fn take<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8], PairingError> {
     Ok(head)
 }
 
-pub(crate) fn normalize_http_relay_base(url: &str) -> String {
+pub fn normalize_http_relay_base(url: &str) -> String {
     url.trim().trim_end_matches('/').to_owned()
 }
 
@@ -895,6 +895,12 @@ impl fmt::Debug for HttpRelay {
 }
 
 impl HttpRelay {
+    /// Relay API base (`http(s)://host`, no trailing slash).
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
     #[must_use]
     pub fn new(base_url: impl Into<String>) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -1032,7 +1038,7 @@ pub enum RelayTransport {
 
 impl RelayTransport {
     /// Opens the transport implied by a locally prepared invite (`send` side).
-    #[must_use]
+    #[must_use = "discarding this loses the pairing transport"]
     pub fn for_sender_prepare(prepared: &PreparedInvite) -> Result<Self, String> {
         match &prepared.relay {
             RendezvousRelay::BeamFs(path) => Ok(Self::Fs(FsRelay::new(path))),
@@ -1048,7 +1054,7 @@ impl RelayTransport {
     }
 
     /// Opens the transport implied by a parsed invite (`recv` side).
-    #[must_use]
+    #[must_use = "discarding this loses the pairing transport"]
     pub fn for_receiver(
         invite: &ParsedInvite,
         relay_dir_override: Option<PathBuf>,
@@ -1057,10 +1063,9 @@ impl RelayTransport {
             (RendezvousRelay::BeamFs(path), _) => Ok(Self::Fs(FsRelay::new(path))),
             (RendezvousRelay::Http(url), _) => Ok(Self::Http(HttpRelay::new(url))),
             (RendezvousRelay::Default, Some(path)) => Ok(Self::Fs(FsRelay::new(path))),
-            (RendezvousRelay::Default, None) => Err(
-                "invite uses relay kind \"default\"; pass --relay-dir with the sender mailbox directory path"
-                    .into(),
-            ),
+            (RendezvousRelay::Default, None) => Ok(Self::Http(HttpRelay::new(
+                crate::relay_default::resolved_public_relay_base_url(),
+            ))),
             (RendezvousRelay::Unsupported(url), _) => Err(format!(
                 "relay URL {url:?} is not supported for pairing transport"
             )),

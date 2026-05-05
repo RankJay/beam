@@ -440,7 +440,7 @@ async fn get_pipe_up(
 }
 
 /// Builds the rendezvous router (shared state is per-process).
-#[must_use]
+#[must_use = "must be served by hyper/axum with `.into_make_service()`"]
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route(

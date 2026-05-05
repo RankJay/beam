@@ -309,6 +309,7 @@ pub fn transfer_one_file_local(
 }
 
 /// Phase 2 local path: same as [`transfer_one_file_local`], but manifest + control + chunk bytes use session crypto (compress is a no-op until wired).
+#[allow(clippy::too_many_arguments)]
 pub fn transfer_one_file_local_encrypted(
     secrets: &SessionSecrets,
     invite: InviteContext,

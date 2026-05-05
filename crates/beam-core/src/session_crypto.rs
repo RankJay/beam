@@ -26,14 +26,8 @@ const CONTROL_PAUSE_PAYLOAD: &[u8] = b"beam.v1.ctrl.pause.v1";
 const CONTROL_TRANSFER_DONE_PAYLOAD: &[u8] = b"beam.v1.ctrl.transfer_done.v1";
 
 /// Invite / rendezvous context bound into every derived key (`[0;32]` acceptable for temporary local pairing).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub struct InviteContext(pub [u8; 32]);
-
-impl Default for InviteContext {
-    fn default() -> Self {
-        InviteContext([0u8; 32])
-    }
-}
 
 /// Negotiated handshake fields both sides serialize identically before key derivation (ADR transcript binding).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -546,8 +540,12 @@ mod connection_serial_tests {
             chunk_size: 64,
             framing_version: 1,
         };
-        let k0 = secrets.derive_keys_for_connection_serial(&binding, 0).unwrap();
-        let k1 = secrets.derive_keys_for_connection_serial(&binding, 1).unwrap();
+        let k0 = secrets
+            .derive_keys_for_connection_serial(&binding, 0)
+            .unwrap();
+        let k1 = secrets
+            .derive_keys_for_connection_serial(&binding, 1)
+            .unwrap();
         assert_ne!(k0.chunk_key(), k1.chunk_key());
         assert_ne!(k0.control_key(), k1.control_key());
     }

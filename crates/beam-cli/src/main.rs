@@ -12,7 +12,8 @@ use beam_core::folder_snapshot::{
     build_folder_snapshot_manifest, transfer_folder_snapshot_local, SnapshotFilters,
 };
 use beam_core::local_transfer::{
-    transfer_one_file_local, transfer_one_file_local_encrypted, DestinationConflictPolicy, LocalReceiver,
+    transfer_one_file_local, transfer_one_file_local_encrypted, DestinationConflictPolicy,
+    LocalReceiver,
 };
 use beam_core::pairing::{
     parse_invite_line, prepare_invite_human_words, prepare_invite_human_words_http,
@@ -22,7 +23,8 @@ use beam_core::pairing::{
 use beam_core::session_crypto::{InviteContext, SessionSecrets};
 use beam_core::session_file::{LocalSessionFileV1, PersistedTransferState};
 use beam_core::{beam_cache_dir, beam_data_dir, beam_sessions_dir};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 
 #[derive(Debug, Parser)]
 #[command(name = "beam", version, about = "Beam file transfer")]
@@ -39,12 +41,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Prepare pairing, print an invite, then wait for a receiver (filesystem mailbox).
+    /// Prepare pairing, print an invite, then wait for a receiver (filesystem or HTTP relay).
     Send {
-        /// Shared mailbox directory (`beam-fs:` rendezvous); mutually exclusive with `--relay-url`.
+        /// When both this and `--relay-url` are omitted, uses the built-in alpha relay URL (`DEFAULT_PUBLIC_RELAY_BASE_URL`), overridable with `BEAM_RELAY_URL`.
         #[arg(long, value_name = "DIR")]
         relay_dir: Option<PathBuf>,
         /// Base URL of `beam-relay` (`http://...`); mutually exclusive with `--relay-dir`.
+        ///
+        /// When both this and `--relay-dir` are omitted, uses the same default as above.
         #[arg(long, value_name = "URL")]
         relay_url: Option<String>,
         /// Invite lifetime in seconds (rendezvous expiry metadata).
@@ -62,7 +66,7 @@ enum Command {
         /// Full single-line invite (TAB-separated fields from `beam send`; quote as one argument).
         #[arg(value_name = "INVITE")]
         invite: String,
-        /// Override mailbox directory when the invite uses relay kind `default`.
+        /// Use this mailbox directory instead of the default HTTP relay when the invite relay kind is `default`.
         #[arg(long, value_name = "DIR")]
         relay_dir: Option<PathBuf>,
         #[arg(long, default_value_t = 600)]
@@ -149,6 +153,11 @@ enum Command {
         #[arg(long, value_name = "BYTES")]
         chunk_size: Option<u64>,
     },
+    /// Emit shell completions for `beam` (stdout).
+    Completions {
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 fn default_staging_path(dest: &Path) -> PathBuf {
@@ -187,6 +196,10 @@ fn main() {
     let json = cli.json;
     let json_stream = cli.json_stream;
     match cli.command {
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            generate(shell, &mut cmd, "beam", &mut std::io::stdout());
+        }
         Command::Send {
             relay_dir,
             relay_url,
@@ -195,6 +208,10 @@ fn main() {
             timeout_secs,
         } => {
             let prepared = match (relay_dir.as_ref(), relay_url.as_ref()) {
+                (Some(_), Some(_)) => {
+                    eprintln!("beam send: specify at most one of --relay-dir or --relay-url");
+                    std::process::exit(1);
+                }
                 (Some(dir), None) => {
                     std::fs::create_dir_all(dir).unwrap_or_else(|e| {
                         eprintln!("beam send: cannot create relay dir: {e}");
@@ -214,9 +231,13 @@ fn main() {
                         prepare_invite_long_token(ttl_secs, url)
                     }
                 }
-                _ => {
-                    eprintln!("beam send: specify exactly one of --relay-dir or --relay-url");
-                    std::process::exit(1);
+                (None, None) => {
+                    let url = beam_core::resolved_public_relay_base_url();
+                    if human_words {
+                        prepare_invite_human_words_http(ttl_secs, &url)
+                    } else {
+                        prepare_invite_long_token(ttl_secs, &url)
+                    }
                 }
             };
             let prepared = prepared.unwrap_or_else(|e| {
@@ -346,7 +367,12 @@ fn main() {
             }
             let staging = staging_dir.unwrap_or_else(|| {
                 to.parent()
-                    .map(|p| p.join(format!("{}.beam-folder-staging", to.file_name().and_then(|n| n.to_str()).unwrap_or("dest"))))
+                    .map(|p| {
+                        p.join(format!(
+                            "{}.beam-folder-staging",
+                            to.file_name().and_then(|n| n.to_str()).unwrap_or("dest")
+                        ))
+                    })
                     .unwrap_or_else(|| PathBuf::from(".beam-folder-staging"))
             });
             let report = transfer_folder_snapshot_local(
@@ -566,11 +592,7 @@ fn main() {
         }
         Command::SessionCancel { path, force } => {
             if !force {
-                exit_cli(
-                    json,
-                    "session-cancel",
-                    "refusing to delete without --force",
-                );
+                exit_cli(json, "session-cancel", "refusing to delete without --force");
             }
             if let Err(e) = std::fs::remove_file(&path) {
                 exit_cli(json, "session-cancel", e);
@@ -661,7 +683,10 @@ fn main() {
                     }));
                 }
             } else if !dry_run {
-                eprintln!("removed {removed} terminal session file(s) under {}", root.display());
+                eprintln!(
+                    "removed {removed} terminal session file(s) under {}",
+                    root.display()
+                );
             }
         }
         Command::BenchmarkLocal {
@@ -675,10 +700,7 @@ fn main() {
                 .and_then(|n| n.to_str())
                 .unwrap_or("file")
                 .to_owned();
-            let base = std::env::temp_dir().join(format!(
-                "beam-bench-{}",
-                std::process::id()
-            ));
+            let base = std::env::temp_dir().join(format!("beam-bench-{}", std::process::id()));
             if let Err(e) = std::fs::create_dir_all(&base) {
                 exit_cli(json, "benchmark-local", e);
             }
@@ -818,6 +840,27 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_send_with_default_relay() {
+        let cli = Cli::try_parse_from(["beam", "send"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Send {
+                relay_dir: None,
+                relay_url: None,
+                ttl_secs: 3600,
+                human_words: false,
+                timeout_secs: 600,
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_parses_completions() {
+        let cli = Cli::try_parse_from(["beam", "completions", "bash"]).expect("parse");
+        assert!(matches!(cli.command, Command::Completions { shell } if shell == Shell::Bash));
+    }
+
+    #[test]
     fn cli_parses_local_transfer_folder() {
         let cli = Cli::try_parse_from([
             "beam",
@@ -877,9 +920,14 @@ mod tests {
 
     #[test]
     fn cli_parses_benchmark_local() {
-        let cli =
-            Cli::try_parse_from(["beam", "benchmark-local", "C:\\x\\f.bin", "--iterations", "2"])
-                .expect("parse");
+        let cli = Cli::try_parse_from([
+            "beam",
+            "benchmark-local",
+            "C:\\x\\f.bin",
+            "--iterations",
+            "2",
+        ])
+        .expect("parse");
         assert!(matches!(
             cli.command,
             Command::BenchmarkLocal {

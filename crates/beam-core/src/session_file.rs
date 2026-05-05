@@ -86,7 +86,9 @@ impl LocalSessionFileV1 {
         let s: Self = serde_json::from_slice(&bytes)
             .map_err(|_| TransferError::SessionState("session file is not valid v1 json"))?;
         if s.format != FILE_FORMAT_V1 {
-            return Err(TransferError::SessionState("unsupported session format version"));
+            return Err(TransferError::SessionState(
+                "unsupported session format version",
+            ));
         }
         Ok(s)
     }
@@ -102,16 +104,14 @@ impl LocalSessionFileV1 {
         let sid = parse_16_hex(&self.session_id_hex).map_err(|_| {
             TransferError::SessionState("session_id_hex must be 32 hex chars (16 bytes)")
         })?;
-        let ikm = parse_32_hex(&self.ikm_hex).map_err(|_| {
-            TransferError::SessionState("ikm_hex must be 64 hex chars (32 bytes)")
-        })?;
+        let ikm = parse_32_hex(&self.ikm_hex)
+            .map_err(|_| TransferError::SessionState("ikm_hex must be 64 hex chars (32 bytes)"))?;
         Ok(SessionSecrets::from_persisted_parts(sid, ikm))
     }
 
     pub fn handshake_binding(&self) -> Result<HandshakeBinding, TransferError> {
-        let invite_bytes = parse_32_hex(&self.invite_context_hex).map_err(|_| {
-            TransferError::SessionState("invite_context_hex must be 64 hex chars")
-        })?;
+        let invite_bytes = parse_32_hex(&self.invite_context_hex)
+            .map_err(|_| TransferError::SessionState("invite_context_hex must be 64 hex chars"))?;
         Ok(HandshakeBinding {
             invite: InviteContext(invite_bytes),
             chunk_size: self.chunk_size,
@@ -133,13 +133,13 @@ impl LocalSessionFileV1 {
     }
 
     pub fn manifest_from_session(&self) -> Result<OneFileManifest, TransferError> {
-        let bytes = decode_hex(&self.manifest_plaintext_hex).map_err(|_| {
-            TransferError::SessionState("manifest_plaintext_hex is invalid hex")
-        })?;
+        let bytes = decode_hex(&self.manifest_plaintext_hex)
+            .map_err(|_| TransferError::SessionState("manifest_plaintext_hex is invalid hex"))?;
         decode_manifest_plaintext(&bytes)
     }
 
     /// Build a new file after the first leg paused mid-transfer.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_receiver_paused(
         secrets: &SessionSecrets,
         binding: &HandshakeBinding,
@@ -227,7 +227,10 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, ()> {
 }
 
 /// Enforce relative path filter on resume (ADR 0043).
-pub fn assert_resume_relative_path(session: &LocalSessionFileV1, relative_path: &str) -> Result<(), TransferError> {
+pub fn assert_resume_relative_path(
+    session: &LocalSessionFileV1,
+    relative_path: &str,
+) -> Result<(), TransferError> {
     if session.relative_path != relative_path {
         return Err(TransferError::ResumeRejected(
             "relative_path does not match persisted session",

@@ -14,20 +14,11 @@ use crate::manifest::OneFileManifest;
 const SNAPSHOT_FORMAT_V1: u32 = 1;
 
 /// Command-local include / exclude rules, recorded in the snapshot manifest (ADR 0041, 0042).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotFilters {
     /// If empty, every path that passes `exclude_globs` is included. Otherwise at least one pattern must match.
     pub include_globs: Vec<String>,
     pub exclude_globs: Vec<String>,
-}
-
-impl Default for SnapshotFilters {
-    fn default() -> Self {
-        Self {
-            include_globs: Vec::new(),
-            exclude_globs: Vec::new(),
-        }
-    }
 }
 
 /// Metadata that must not be restored blindly (ADR 0012).
@@ -68,19 +59,27 @@ pub struct FolderSnapshotManifest {
 impl FolderSnapshotManifest {
     pub fn validate(&self) -> Result<(), TransferError> {
         if self.format_version != SNAPSHOT_FORMAT_V1 {
-            return Err(TransferError::InvalidManifest("unknown folder snapshot format_version"));
+            return Err(TransferError::InvalidManifest(
+                "unknown folder snapshot format_version",
+            ));
         }
         if self.root_label.is_empty() {
-            return Err(TransferError::InvalidManifest("root_label must be non-empty"));
+            return Err(TransferError::InvalidManifest(
+                "root_label must be non-empty",
+            ));
         }
         let mut seen: BTreeMap<String, ()> = BTreeMap::new();
         for e in &self.entries {
             let rel = Self::entry_rel(e);
             if rel.is_empty() {
-                return Err(TransferError::InvalidManifest("entry rel_path must be non-empty"));
+                return Err(TransferError::InvalidManifest(
+                    "entry rel_path must be non-empty",
+                ));
             }
             if rel.contains('\\') {
-                return Err(TransferError::InvalidManifest("entry paths must be posix-style"));
+                return Err(TransferError::InvalidManifest(
+                    "entry paths must be posix-style",
+                ));
             }
             if seen.insert(rel.to_string(), ()).is_some() {
                 return Err(TransferError::InvalidManifest("duplicate manifest path"));
@@ -104,7 +103,10 @@ impl FolderSnapshotManifest {
     #[must_use]
     pub fn approval_summary_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
-        lines.push(format!("folder_snapshot v{} root={}", self.format_version, self.root_label));
+        lines.push(format!(
+            "folder_snapshot v{} root={}",
+            self.format_version, self.root_label
+        ));
         if !self.filters.include_globs.is_empty() || !self.filters.exclude_globs.is_empty() {
             lines.push(format!(
                 "filters: include={:?} exclude={:?}",
@@ -145,13 +147,15 @@ impl CompiledFilters {
         let mut include = Vec::with_capacity(f.include_globs.len());
         for g in &f.include_globs {
             include.push(
-                Pattern::new(g).map_err(|_| TransferError::InvalidManifest("invalid include glob"))?,
+                Pattern::new(g)
+                    .map_err(|_| TransferError::InvalidManifest("invalid include glob"))?,
             );
         }
         let mut exclude = Vec::with_capacity(f.exclude_globs.len());
         for g in &f.exclude_globs {
             exclude.push(
-                Pattern::new(g).map_err(|_| TransferError::InvalidManifest("invalid exclude glob"))?,
+                Pattern::new(g)
+                    .map_err(|_| TransferError::InvalidManifest("invalid exclude glob"))?,
             );
         }
         Ok(Self { include, exclude })
@@ -189,7 +193,9 @@ pub fn build_folder_snapshot_manifest(
         return Err(TransferError::NotADirectory(source_root.to_path_buf()));
     }
     if root_label.is_empty() {
-        return Err(TransferError::InvalidManifest("root_label must be non-empty"));
+        return Err(TransferError::InvalidManifest(
+            "root_label must be non-empty",
+        ));
     }
 
     let compiled = CompiledFilters::new(&filters)?;
@@ -205,8 +211,7 @@ pub fn build_folder_snapshot_manifest(
             RawKind::File => {
                 let abs = join_rel(source_root, &rel);
                 let manifest_path = format!("{}/{}", root_label.trim_end_matches('/'), rel);
-                let manifest =
-                    manifest_from_plaintext_file(&abs, &manifest_path, chunk_size)?;
+                let manifest = manifest_from_plaintext_file(&abs, &manifest_path, chunk_size)?;
                 entries.push(FolderManifestEntry::File {
                     rel_path: rel,
                     manifest,
@@ -233,9 +238,7 @@ pub fn build_folder_snapshot_manifest(
 enum RawKind {
     Dir,
     File,
-    Symlink {
-        target: Option<String>,
-    },
+    Symlink { target: Option<String> },
 }
 
 fn join_rel(root: &Path, rel_posix: &str) -> PathBuf {
@@ -254,15 +257,14 @@ fn walk_tree(
     let current_dir = join_rel(source_root, rel_prefix);
 
     let read = fs::read_dir(&current_dir)?;
-    let mut names: Vec<std::ffi::OsString> = read
-        .filter_map(|e| e.ok().map(|x| x.file_name()))
-        .collect();
+    let mut names: Vec<std::ffi::OsString> =
+        read.filter_map(|e| e.ok().map(|x| x.file_name())).collect();
     names.sort();
 
     for name in names {
-        let name_str = name.to_str().ok_or(TransferError::InvalidManifest(
-            "path is not valid UTF-8",
-        ))?;
+        let name_str = name
+            .to_str()
+            .ok_or(TransferError::InvalidManifest("path is not valid UTF-8"))?;
         let rel = if rel_prefix.is_empty() {
             name_str.to_string()
         } else {
@@ -276,7 +278,9 @@ fn walk_tree(
         let path = current_dir.join(&name);
         let symlink_meta = fs::symlink_metadata(&path)?;
         if symlink_meta.file_type().is_symlink() {
-            let target = fs::read_link(&path).ok().and_then(|p| p.to_str().map(|s| s.to_string()));
+            let target = fs::read_link(&path)
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()));
             out.push((rel_posix, RawKind::Symlink { target }));
             continue;
         }
@@ -344,10 +348,7 @@ pub fn transfer_folder_snapshot_local(
                     .by_rel_path
                     .insert(rel_path.clone(), FolderEntryOutcome::SkippedDangerous);
             }
-            FolderManifestEntry::File {
-                rel_path,
-                manifest,
-            } => {
+            FolderManifestEntry::File { rel_path, manifest } => {
                 let abs_src = join_rel(source_root, rel_path);
                 let dest_file = join_rel(dest_root, rel_path);
                 if let Some(parent) = dest_file.parent() {
@@ -359,7 +360,8 @@ pub fn transfer_folder_snapshot_local(
                 ));
 
                 let xfer = (|| {
-                    let provider = LocalProvider::with_frozen_file_manifest(abs_src, manifest.clone())?;
+                    let provider =
+                        LocalProvider::with_frozen_file_manifest(abs_src, manifest.clone())?;
                     let mut receiver = LocalReceiver::new(
                         manifest.clone(),
                         staging.clone(),

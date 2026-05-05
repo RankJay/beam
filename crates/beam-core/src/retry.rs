@@ -16,9 +16,7 @@ pub fn transfer_error_is_transient_transport(e: &TransferError) -> bool {
         TransferError::RelayHttpTransient { .. } => true,
         TransferError::RelayPipe(msg) => matches!(
             *msg,
-            "pipe PUT transport failed"
-                | "pipe GET transport failed"
-                | "pipe GET body failed"
+            "pipe PUT transport failed" | "pipe GET transport failed" | "pipe GET body failed"
         ),
         _ => false,
     }
@@ -104,7 +102,10 @@ impl RetryPolicy {
     }
 
     /// Same semantics as [`Self::retry_transfer_blocking`] for pairing / rendezvous HTTP.
-    pub fn retry_pairing_blocking<T, F>(&self, mut attempt: F) -> Result<T, crate::pairing::PairingError>
+    pub fn retry_pairing_blocking<T, F>(
+        &self,
+        mut attempt: F,
+    ) -> Result<T, crate::pairing::PairingError>
     where
         F: FnMut() -> Result<T, crate::pairing::PairingError>,
     {
